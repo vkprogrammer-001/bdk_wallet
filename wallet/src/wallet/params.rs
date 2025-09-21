@@ -12,6 +12,32 @@ use crate::{
 
 use super::{ChangeSet, LoadError, PersistedWallet};
 
+fn make_two_path_descriptor_to_extract<D>(
+    two_path_descriptor: D,
+    index: usize,
+) -> DescriptorToExtract
+where
+    D: IntoWalletDescriptor + Send + 'static,
+{
+    Box::new(move |secp, network| {
+        let (desc, keymap) = two_path_descriptor.into_wallet_descriptor(secp, network)?;
+
+        if !desc.is_multipath() {
+            return Err(DescriptorError::MultiPath);
+        }
+
+        let descriptors = desc
+            .into_single_descriptors()
+            .map_err(DescriptorError::Miniscript)?;
+
+        if descriptors.len() != 2 {
+            return Err(DescriptorError::MultiPath);
+        }
+
+        Ok((descriptors[index].clone(), keymap))
+    })
+}
+
 /// This atrocity is to avoid having type parameters on [`CreateParams`] and [`LoadParams`].
 ///
 /// The better option would be to do `Box<dyn IntoWalletDescriptor>`, but we cannot due to Rust's
@@ -39,6 +65,7 @@ pub struct CreateParams {
     pub(crate) network: Network,
     pub(crate) genesis_hash: Option<BlockHash>,
     pub(crate) lookahead: u32,
+    pub(crate) use_spk_cache: bool,
 }
 
 impl CreateParams {
@@ -61,6 +88,7 @@ impl CreateParams {
             network: Network::Bitcoin,
             genesis_hash: None,
             lookahead: DEFAULT_LOOKAHEAD,
+            use_spk_cache: false,
         }
     }
 
@@ -82,6 +110,32 @@ impl CreateParams {
             network: Network::Bitcoin,
             genesis_hash: None,
             lookahead: DEFAULT_LOOKAHEAD,
+            use_spk_cache: false,
+        }
+    }
+
+    /// Construct parameters with a two-path descriptor that will be parsed into receive and change
+    /// descriptors.
+    ///
+    /// This function parses a two-path descriptor (receive and change) and creates parameters
+    /// using the existing receive and change wallet creation logic.
+    ///
+    /// Default values:
+    /// * `network` = [`Network::Bitcoin`]
+    /// * `genesis_hash` = `None`
+    /// * `lookahead` = [`DEFAULT_LOOKAHEAD`]
+    pub fn new_two_path<D: IntoWalletDescriptor + Send + Clone + 'static>(
+        two_path_descriptor: D,
+    ) -> Self {
+        Self {
+            descriptor: make_two_path_descriptor_to_extract(two_path_descriptor.clone(), 0),
+            descriptor_keymap: KeyMap::default(),
+            change_descriptor: Some(make_two_path_descriptor_to_extract(two_path_descriptor, 1)),
+            change_descriptor_keymap: KeyMap::default(),
+            network: Network::Bitcoin,
+            genesis_hash: None,
+            lookahead: DEFAULT_LOOKAHEAD,
+            use_spk_cache: false,
         }
     }
 
@@ -115,6 +169,15 @@ impl CreateParams {
     /// the default value [`DEFAULT_LOOKAHEAD`] is sufficient.
     pub fn lookahead(mut self, lookahead: u32) -> Self {
         self.lookahead = lookahead;
+        self
+    }
+
+    /// Use a persistent cache of indexed script pubkeys (SPKs).
+    ///
+    /// **Note:** To persist across restarts, this option must also be set at load time with
+    /// [`LoadParams`](LoadParams::use_spk_cache).
+    pub fn use_spk_cache(mut self, use_spk_cache: bool) -> Self {
+        self.use_spk_cache = use_spk_cache;
         self
     }
 
@@ -157,6 +220,7 @@ pub struct LoadParams {
     pub(crate) check_descriptor: Option<Option<DescriptorToExtract>>,
     pub(crate) check_change_descriptor: Option<Option<DescriptorToExtract>>,
     pub(crate) extract_keys: bool,
+    pub(crate) use_spk_cache: bool,
 }
 
 impl LoadParams {
@@ -173,6 +237,7 @@ impl LoadParams {
             check_descriptor: None,
             check_change_descriptor: None,
             extract_keys: false,
+            use_spk_cache: false,
         }
     }
 
@@ -231,6 +296,15 @@ impl LoadParams {
     /// See also [`LoadParams::descriptor`].
     pub fn extract_keys(mut self) -> Self {
         self.extract_keys = true;
+        self
+    }
+
+    /// Use a persistent cache of indexed script pubkeys (SPKs).
+    ///
+    /// **Note:** This should only be used if you have previously persisted a cache of script
+    /// pubkeys using [`CreateParams::use_spk_cache`].
+    pub fn use_spk_cache(mut self, use_spk_cache: bool) -> Self {
+        self.use_spk_cache = use_spk_cache;
         self
     }
 

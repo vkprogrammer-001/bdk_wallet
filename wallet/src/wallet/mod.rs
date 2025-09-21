@@ -30,8 +30,8 @@ use bdk_chain::{
         SyncResponse,
     },
     tx_graph::{CalculateFeeError, CanonicalTx, TxGraph, TxUpdate},
-    BlockId, ChainPosition, ConfirmationBlockTime, DescriptorExt, FullTxOut, Indexed,
-    IndexedTxGraph, Indexer, Merge,
+    BlockId, CanonicalizationParams, ChainPosition, ConfirmationBlockTime, DescriptorExt,
+    FullTxOut, Indexed, IndexedTxGraph, Indexer, Merge,
 };
 use bitcoin::{
     absolute,
@@ -41,7 +41,7 @@ use bitcoin::{
     secp256k1::Secp256k1,
     sighash::{EcdsaSighashType, TapSighashType},
     transaction, Address, Amount, Block, BlockHash, FeeRate, Network, OutPoint, Psbt, ScriptBuf,
-    Sequence, Transaction, TxOut, Txid, Weight, Witness,
+    Sequence, SignedAmount, Transaction, TxOut, Txid, Weight, Witness,
 };
 use miniscript::{
     descriptor::KeyMap,
@@ -81,11 +81,12 @@ pub use changeset::ChangeSet;
 pub use params::*;
 pub use persisted::*;
 pub use utils::IsDust;
+pub use utils::TxDetails;
 
 /// A Bitcoin wallet
 ///
-/// The `Wallet` acts as a way of coherently interfacing with output descriptors and related transactions.
-/// Its main components are:
+/// The `Wallet` acts as a way of coherently interfacing with output descriptors and related
+/// transactions. Its main components are:
 ///
 /// 1. output *descriptors* from which it can derive addresses.
 /// 2. [`signer`]s that can contribute signatures to addresses instantiated from the descriptors.
@@ -194,9 +195,9 @@ impl fmt::Display for LoadError {
             LoadError::MissingNetwork => write!(f, "loaded data is missing network type"),
             LoadError::MissingGenesis => write!(f, "loaded data is missing genesis hash"),
             LoadError::MissingDescriptor(k) => {
-                write!(f, "loaded data is missing descriptor for keychain {k:?}")
+                write!(f, "loaded data is missing descriptor for {k} keychain")
             }
-            LoadError::Mismatch(mismatch) => write!(f, "data mismatch: {mismatch:?}"),
+            LoadError::Mismatch(e) => write!(f, "{e}"),
         }
     }
 }
@@ -230,6 +231,39 @@ pub enum LoadMismatch {
         /// The expected descriptor.
         expected: Option<ExtendedDescriptor>,
     },
+}
+
+impl fmt::Display for LoadMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LoadMismatch::Network { loaded, expected } => {
+                write!(f, "Network mismatch: loaded {loaded}, expected {expected}")
+            }
+            LoadMismatch::Genesis { loaded, expected } => {
+                write!(
+                    f,
+                    "Genesis hash mismatch: loaded {loaded}, expected {expected}"
+                )
+            }
+            LoadMismatch::Descriptor {
+                keychain,
+                loaded,
+                expected,
+            } => {
+                write!(
+                    f,
+                    "Descriptor mismatch for {} keychain: loaded {}, expected {}",
+                    keychain,
+                    loaded
+                        .as_ref()
+                        .map_or("None".to_string(), |d| d.to_string()),
+                    expected
+                        .as_ref()
+                        .map_or("None".to_string(), |d| d.to_string())
+                )
+            }
+        }
+    }
 }
 
 impl From<LoadMismatch> for LoadError {
@@ -267,8 +301,7 @@ impl fmt::Display for ApplyBlockError {
                 connected_to_hash: checkpoint_hash,
             } => write!(
                 f,
-                "`connected_to` hash {} differs from the expected hash {} (which is derived from `block`)",
-                checkpoint_hash, block_hash
+                "`connected_to` hash {checkpoint_hash} differs from the expected hash {block_hash} (which is derived from `block`)"
             ),
         }
     }
@@ -363,6 +396,47 @@ impl Wallet {
         CreateParams::new(descriptor, change_descriptor)
     }
 
+    /// Build a new [`Wallet`] from a two-path descriptor.
+    ///
+    /// This function parses a multipath descriptor with exactly 2 paths and creates a wallet
+    /// using the existing receive and change wallet creation logic. Note that you can only use this
+    /// method with public extended keys (`xpub` prefix) to create watch-only wallets.
+    ///
+    /// Multipath descriptors follow [BIP 389] and allow defining both receive and change
+    /// derivation paths in a single descriptor using the `<0;1>` syntax.
+    ///
+    /// If you have previously created a wallet, use [`load`](Self::load) instead.
+    ///
+    /// # Errors
+    /// Returns an error if the descriptor is invalid, not a 2-path multipath descriptor, or if
+    /// the descriptor provided contains an extended private key (`xprv` prefix).
+    ///
+    /// # Synopsis
+    ///
+    /// ```rust
+    /// # use bdk_wallet::Wallet;
+    /// # use bitcoin::Network;
+    /// # use bdk_wallet::KeychainKind;
+    /// # const TWO_PATH_DESC: &str = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)";
+    /// let wallet = Wallet::create_from_two_path_descriptor(TWO_PATH_DESC)
+    ///     .network(Network::Testnet)
+    ///     .create_wallet_no_persist()
+    ///     .unwrap();
+    ///
+    /// // The multipath descriptor automatically creates separate receive and change descriptors
+    /// let receive_addr = wallet.peek_address(KeychainKind::External, 0);  // Uses path /0/*
+    /// let change_addr = wallet.peek_address(KeychainKind::Internal, 0);   // Uses path /1/*
+    /// assert_ne!(receive_addr.address, change_addr.address);
+    /// ```
+    ///
+    /// [BIP 389]: https://github.com/bitcoin/bips/blob/master/bip-0389.mediawiki
+    pub fn create_from_two_path_descriptor<D>(two_path_descriptor: D) -> CreateParams
+    where
+        D: IntoWalletDescriptor + Send + Clone + 'static,
+    {
+        CreateParams::new_two_path(two_path_descriptor)
+    }
+
     /// Create a new [`Wallet`] with given `params`.
     ///
     /// Refer to [`Wallet::create`] for more.
@@ -399,21 +473,23 @@ impl Wallet {
             None => (None, Arc::new(SignersContainer::new())),
         };
 
-        let index = create_indexer(descriptor, change_descriptor, params.lookahead)?;
+        let mut stage = ChangeSet {
+            descriptor: Some(descriptor.clone()),
+            change_descriptor: change_descriptor.clone(),
+            local_chain: chain_changeset,
+            network: Some(network),
+            ..Default::default()
+        };
 
-        let descriptor = index.get_descriptor(KeychainKind::External).cloned();
-        let change_descriptor = index.get_descriptor(KeychainKind::Internal).cloned();
-        let indexed_graph = IndexedTxGraph::new(index);
-        let indexed_graph_changeset = indexed_graph.initial_changeset();
-
-        let stage = ChangeSet {
+        let indexed_graph = make_indexed_graph(
+            &mut stage,
+            Default::default(),
+            Default::default(),
             descriptor,
             change_descriptor,
-            local_chain: chain_changeset,
-            tx_graph: indexed_graph_changeset.tx_graph,
-            indexer: indexed_graph_changeset.indexer,
-            network: Some(network),
-        };
+            params.lookahead,
+            params.use_spk_cache,
+        )?;
 
         Ok(Wallet {
             signers,
@@ -478,7 +554,7 @@ impl Wallet {
 
     /// Load [`Wallet`] from the given previously persisted [`ChangeSet`] and `params`.
     ///
-    /// Refer to [`Wallet::load`] for more.
+    /// Returns `Ok(None)` if the changeset is empty. Refer to [`Wallet::load`] for more.
     pub fn load_with_params(
         changeset: ChangeSet,
         params: LoadParams,
@@ -598,14 +674,18 @@ impl Wallet {
             None => Arc::new(SignersContainer::new()),
         };
 
-        let index = create_indexer(descriptor, change_descriptor, params.lookahead)
-            .map_err(LoadError::Descriptor)?;
+        let mut stage = ChangeSet::default();
 
-        let mut indexed_graph = IndexedTxGraph::new(index);
-        indexed_graph.apply_changeset(changeset.indexer.into());
-        indexed_graph.apply_changeset(changeset.tx_graph.into());
-
-        let stage = ChangeSet::default();
+        let indexed_graph = make_indexed_graph(
+            &mut stage,
+            changeset.tx_graph,
+            changeset.indexer,
+            descriptor,
+            change_descriptor,
+            params.lookahead,
+            params.use_spk_cache,
+        )
+        .map_err(LoadError::Descriptor)?;
 
         Ok(Some(Wallet {
             signers,
@@ -735,7 +815,8 @@ impl Wallet {
     /// derivation index that hasn't been used in a transaction.
     ///
     /// This will attempt to reveal a new address if all previously revealed addresses have
-    /// been used, in which case the returned address will be the same as calling [`Wallet::reveal_next_address`].
+    /// been used, in which case the returned address will be the same as calling
+    /// [`Wallet::reveal_next_address`].
     ///
     /// **WARNING**: To avoid address reuse you must persist the changes resulting from one or more
     /// calls to this method before closing the wallet. See [`Wallet::reveal_next_address`].
@@ -816,9 +897,37 @@ impl Wallet {
             .filter_chain_unspents(
                 &self.chain,
                 self.chain.tip().block_id(),
+                CanonicalizationParams::default(),
                 self.indexed_graph.index.outpoints().iter().cloned(),
             )
             .map(|((k, i), full_txo)| new_local_utxo(k, i, full_txo))
+    }
+
+    /// Get the [`TxDetails`] of a wallet transaction.
+    ///
+    /// If the transaction with txid [`Txid`] cannot be found in the wallet's transactions, `None`
+    /// is returned.
+    pub fn tx_details(&self, txid: Txid) -> Option<TxDetails> {
+        let tx: WalletTx = self.transactions().find(|c| c.tx_node.txid == txid)?;
+
+        let (sent, received) = self.sent_and_received(&tx.tx_node.tx);
+        let fee: Option<Amount> = self.calculate_fee(&tx.tx_node.tx).ok();
+        let fee_rate: Option<FeeRate> = self.calculate_fee_rate(&tx.tx_node.tx).ok();
+        let balance_delta: SignedAmount = self.indexed_graph.index.net_value(&tx.tx_node.tx, ..);
+        let chain_position = tx.chain_position;
+
+        let tx_details: TxDetails = TxDetails {
+            txid,
+            received,
+            sent,
+            fee,
+            fee_rate,
+            balance_delta,
+            chain_position,
+            tx: tx.tx_node.tx,
+        };
+
+        Some(tx_details)
     }
 
     /// List all relevant outputs (includes both spent and unspent, confirmed and unconfirmed).
@@ -830,6 +939,7 @@ impl Wallet {
             .filter_chain_txouts(
                 &self.chain,
                 self.chain.tip().block_id(),
+                CanonicalizationParams::default(),
                 self.indexed_graph.index.outpoints().iter().cloned(),
             )
             .map(|((k, i), full_txo)| new_local_utxo(k, i, full_txo))
@@ -883,6 +993,7 @@ impl Wallet {
             .filter_chain_unspents(
                 &self.chain,
                 self.chain.tip().block_id(),
+                CanonicalizationParams::default(),
                 core::iter::once(((), op)),
             )
             .map(|(_, full_txo)| new_local_utxo(keychain, index, full_txo))
@@ -911,7 +1022,8 @@ impl Wallet {
         self.stage.merge(additions.into());
     }
 
-    /// Calculates the fee of a given transaction. Returns [`Amount::ZERO`] if `tx` is a coinbase transaction.
+    /// Calculates the fee of a given transaction. Returns [`Amount::ZERO`] if `tx` is a coinbase
+    /// transaction.
     ///
     /// To calculate the fee for a [`Transaction`] with inputs not owned by this wallet you must
     /// manually insert the TxOut(s) into the tx graph using the [`insert_txout`] function.
@@ -944,8 +1056,8 @@ impl Wallet {
 
     /// Calculate the [`FeeRate`] for a given transaction.
     ///
-    /// To calculate the fee rate for a [`Transaction`] with inputs not owned by this wallet you must
-    /// manually insert the TxOut(s) into the tx graph using the [`insert_txout`] function.
+    /// To calculate the fee rate for a [`Transaction`] with inputs not owned by this wallet you
+    /// must manually insert the TxOut(s) into the tx graph using the [`insert_txout`] function.
     ///
     /// Note `tx` does not have to be in the graph for this to work.
     ///
@@ -1047,18 +1159,22 @@ impl Wallet {
     ///         "tx is an ancestor of a tx anchored in {}:{}",
     ///         anchor.block_id.height, anchor.block_id.hash,
     ///     ),
-    ///     ChainPosition::Unconfirmed { last_seen } => println!(
-    ///         "tx is last seen at {:?}, it is unconfirmed as it is not anchored in the best chain",
-    ///         last_seen,
+    ///     ChainPosition::Unconfirmed { first_seen, last_seen } => println!(
+    ///         "tx is first seen at {:?}, last seen at {:?}, it is unconfirmed as it is not anchored in the best chain",
+    ///         first_seen, last_seen
     ///     ),
     /// }
     /// ```
     ///
     /// [`Anchor`]: bdk_chain::Anchor
-    pub fn get_tx(&self, txid: Txid) -> Option<WalletTx> {
+    pub fn get_tx(&self, txid: Txid) -> Option<WalletTx<'_>> {
         let graph = self.indexed_graph.graph();
         graph
-            .list_canonical_txs(&self.chain, self.chain.tip().block_id())
+            .list_canonical_txs(
+                &self.chain,
+                self.chain.tip().block_id(),
+                CanonicalizationParams::default(),
+            )
             .find(|tx| tx.tx_node.txid == txid)
     }
 
@@ -1073,11 +1189,15 @@ impl Wallet {
     ///
     /// To iterate over all canonical transactions, including those that are irrelevant, use
     /// [`TxGraph::list_canonical_txs`].
-    pub fn transactions(&self) -> impl Iterator<Item = WalletTx> + '_ {
+    pub fn transactions<'a>(&'a self) -> impl Iterator<Item = WalletTx<'a>> + 'a {
         let tx_graph = self.indexed_graph.graph();
         let tx_index = &self.indexed_graph.index;
         tx_graph
-            .list_canonical_txs(&self.chain, self.chain.tip().block_id())
+            .list_canonical_txs(
+                &self.chain,
+                self.chain.tip().block_id(),
+                CanonicalizationParams::default(),
+            )
             .filter(|c_tx| tx_index.is_tx_relevant(&c_tx.tx_node.tx))
     }
 
@@ -1097,7 +1217,7 @@ impl Wallet {
     ///     wallet.transactions_sort_by(|tx1, tx2| tx2.chain_position.cmp(&tx1.chain_position));
     /// # Ok::<(), anyhow::Error>(())
     /// ```
-    pub fn transactions_sort_by<F>(&self, compare: F) -> Vec<WalletTx>
+    pub fn transactions_sort_by<F>(&self, compare: F) -> Vec<WalletTx<'_>>
     where
         F: FnMut(&WalletTx, &WalletTx) -> Ordering,
     {
@@ -1106,12 +1226,13 @@ impl Wallet {
         txs
     }
 
-    /// Return the balance, separated into available, trusted-pending, untrusted-pending and immature
-    /// values.
+    /// Return the balance, separated into available, trusted-pending, untrusted-pending, and
+    /// immature values.
     pub fn balance(&self) -> Balance {
         self.indexed_graph.graph().balance(
             &self.chain,
             self.chain.tip().block_id(),
+            CanonicalizationParams::default(),
             self.indexed_graph.index.outpoints().iter().cloned(),
             |&(k, _), _| k == KeychainKind::Internal,
         )
@@ -1183,7 +1304,8 @@ impl Wallet {
 
     /// Start building a transaction.
     ///
-    /// This returns a blank [`TxBuilder`] from which you can specify the parameters for the transaction.
+    /// This returns a blank [`TxBuilder`] from which you can specify the parameters for the
+    /// transaction.
     ///
     /// ## Example
     ///
@@ -1239,8 +1361,8 @@ impl Wallet {
             })
             .transpose()?;
 
-        // The policy allows spending external outputs, but it requires a policy path that hasn't been
-        // provided
+        // The policy allows spending external outputs, but it requires a policy path that hasn't
+        // been provided
         if params.change_policy != tx_builder::ChangeSpendPolicy::OnlyChange
             && external_policy.requires_path()
             && params.external_policy_path.is_none()
@@ -1315,7 +1437,8 @@ impl Wallet {
                 match requirements.timelock {
                     // No requirement, just use the fee_sniping_height
                     None => fee_sniping_height,
-                    // There's a block-based requirement, but the value is lower than the fee_sniping_height
+                    // There's a block-based requirement, but the value is lower than the
+                    // fee_sniping_height
                     Some(value @ absolute::LockTime::Blocks(_)) if value < fee_sniping_height => {
                         fee_sniping_height
                     }
@@ -1419,7 +1542,7 @@ impl Wallet {
 
         let (required_utxos, optional_utxos) = {
             // NOTE: manual selection overrides unspendable
-            let mut required: Vec<WeightedUtxo> = params.utxos.values().cloned().collect();
+            let mut required: Vec<WeightedUtxo> = params.utxos.clone();
             let optional = self.filter_utxos(&params, current_height.to_consensus_u32());
 
             // if drain_wallet is true, all UTxOs are required
@@ -1529,13 +1652,12 @@ impl Wallet {
 
         // recording changes to the change keychain
         if let (Excess::Change { .. }, Some((keychain, index))) = (excess, drain_index) {
-            let (_, index_changeset) = self
-                .indexed_graph
-                .index
-                .reveal_to_target(keychain, index)
-                .expect("must not be None");
-            self.stage.merge(index_changeset.into());
-            self.mark_used(keychain, index);
+            if let Some((_, index_changeset)) =
+                self.indexed_graph.index.reveal_to_target(keychain, index)
+            {
+                self.stage.merge(index_changeset.into());
+                self.mark_used(keychain, index);
+            }
         }
 
         Ok(psbt)
@@ -1590,7 +1712,7 @@ impl Wallet {
         let txout_index = &self.indexed_graph.index;
         let chain_tip = self.chain.tip().block_id();
         let chain_positions = graph
-            .list_canonical_txs(&self.chain, chain_tip)
+            .list_canonical_txs(&self.chain, chain_tip, CanonicalizationParams::default())
             .map(|canon_tx| (canon_tx.tx_node.txid, canon_tx.chain_position))
             .collect::<HashMap<Txid, _>>();
 
@@ -1636,61 +1758,58 @@ impl Wallet {
                     .ok_or(BuildFeeBumpError::UnknownUtxo(txin.previous_output))
                     // Get chain position
                     .and_then(|prev_tx| {
-                        chain_positions
+                        let chain_position = chain_positions
                             .get(&txin.previous_output.txid)
                             .cloned()
-                            .ok_or(BuildFeeBumpError::UnknownUtxo(txin.previous_output))
-                            .map(|chain_position| (prev_tx, chain_position))
+                            .ok_or(BuildFeeBumpError::UnknownUtxo(txin.previous_output))?;
+                        let prev_txout = prev_tx
+                            .output
+                            .get(txin.previous_output.vout as usize)
+                            .ok_or(BuildFeeBumpError::InvalidOutputIndex(txin.previous_output))
+                            .cloned()?;
+                        Ok((prev_tx, prev_txout, chain_position))
                     })
-                    .map(|(prev_tx, chain_position)| {
-                        let txout = prev_tx.output[txin.previous_output.vout as usize].clone();
-                        match txout_index.index_of_spk(txout.script_pubkey.clone()) {
-                            Some(&(keychain, derivation_index)) => (
-                                txin.previous_output,
-                                WeightedUtxo {
-                                    satisfaction_weight: self
-                                        .public_descriptor(keychain)
-                                        .max_weight_to_satisfy()
-                                        .unwrap(),
-                                    utxo: Utxo::Local(LocalOutput {
-                                        outpoint: txin.previous_output,
-                                        txout: txout.clone(),
-                                        keychain,
-                                        is_spent: true,
-                                        derivation_index,
-                                        chain_position,
-                                    }),
-                                },
-                            ),
+                    .map(|(prev_tx, prev_txout, chain_position)| {
+                        match txout_index.index_of_spk(prev_txout.script_pubkey.clone()) {
+                            Some(&(keychain, derivation_index)) => WeightedUtxo {
+                                satisfaction_weight: self
+                                    .public_descriptor(keychain)
+                                    .max_weight_to_satisfy()
+                                    .unwrap(),
+                                utxo: Utxo::Local(LocalOutput {
+                                    outpoint: txin.previous_output,
+                                    txout: prev_txout.clone(),
+                                    keychain,
+                                    is_spent: true,
+                                    derivation_index,
+                                    chain_position,
+                                }),
+                            },
                             None => {
                                 let satisfaction_weight = Weight::from_wu_usize(
                                     serialize(&txin.script_sig).len() * 4
                                         + serialize(&txin.witness).len(),
                                 );
-
-                                (
-                                    txin.previous_output,
-                                    WeightedUtxo {
-                                        utxo: Utxo::Foreign {
-                                            outpoint: txin.previous_output,
-                                            sequence: txin.sequence,
-                                            psbt_input: Box::new(psbt::Input {
-                                                witness_utxo: txout
-                                                    .script_pubkey
-                                                    .witness_version()
-                                                    .map(|_| txout.clone()),
-                                                non_witness_utxo: Some(prev_tx.as_ref().clone()),
-                                                ..Default::default()
-                                            }),
-                                        },
-                                        satisfaction_weight,
+                                WeightedUtxo {
+                                    utxo: Utxo::Foreign {
+                                        outpoint: txin.previous_output,
+                                        sequence: txin.sequence,
+                                        psbt_input: Box::new(psbt::Input {
+                                            witness_utxo: prev_txout
+                                                .script_pubkey
+                                                .witness_version()
+                                                .map(|_| prev_txout.clone()),
+                                            non_witness_utxo: Some(prev_tx.as_ref().clone()),
+                                            ..Default::default()
+                                        }),
                                     },
-                                )
+                                    satisfaction_weight,
+                                }
                             }
                         }
                     })
             })
-            .collect::<Result<HashMap<OutPoint, WeightedUtxo>, BuildFeeBumpError>>()?;
+            .collect::<Result<Vec<WeightedUtxo>, BuildFeeBumpError>>()?;
 
         if tx.output.len() > 1 {
             let mut change_index = None;
@@ -1733,7 +1852,8 @@ impl Wallet {
     }
 
     /// Sign a transaction with all the wallet's signers, in the order specified by every signer's
-    /// [`SignerOrdering`]. This function returns the `Result` type with an encapsulated `bool` that has the value true if the PSBT was finalized, or false otherwise.
+    /// [`SignerOrdering`]. This function returns the `Result` type with an encapsulated `bool` that
+    /// has the value true if the PSBT was finalized, or false otherwise.
     ///
     /// The [`SignOptions`] can be used to tweak the behavior of the software signers, and the way
     /// the transaction is finalized at the end. Note that it can't be guaranteed that *every*
@@ -1765,8 +1885,8 @@ impl Wallet {
         self.update_psbt_with_descriptor(psbt)
             .map_err(SignerError::MiniscriptPsbt)?;
 
-        // If we aren't allowed to use `witness_utxo`, ensure that every input (except p2tr and finalized ones)
-        // has the `non_witness_utxo`
+        // If we aren't allowed to use `witness_utxo`, ensure that every input (except p2tr and
+        // finalized ones) has the `non_witness_utxo`
         if !sign_options.trust_witness_utxo
             && psbt
                 .inputs
@@ -1858,7 +1978,7 @@ impl Wallet {
         let confirmation_heights = self
             .indexed_graph
             .graph()
-            .list_canonical_txs(&self.chain, chain_tip)
+            .list_canonical_txs(&self.chain, chain_tip, CanonicalizationParams::default())
             .filter(|canon_tx| prev_txids.contains(&canon_tx.tx_node.txid))
             // This is for a small performance gain. Although `.filter` filters out excess txs, it
             // will still consume the internal `CanonicalIter` entirely. Having a `.take` here
@@ -1879,7 +1999,7 @@ impl Wallet {
             let psbt_input = &psbt
                 .inputs
                 .get(n)
-                .ok_or(SignerError::InputIndexOutOfRange)?;
+                .ok_or(IndexOutOfBoundsError::new(n, psbt.inputs.len()))?;
             if psbt_input.final_script_sig.is_some() || psbt_input.final_script_witness.is_some() {
                 continue;
             }
@@ -1892,8 +2012,8 @@ impl Wallet {
 
             // - Try to derive the descriptor by looking at the txout. If it's in our database, we
             //   know exactly which `keychain` to use, and which derivation index it is
-            // - If that fails, try to derive it by looking at the psbt input: the complete logic
-            //   is in `src/descriptor/mod.rs`, but it will basically look at `bip32_derivation`,
+            // - If that fails, try to derive it by looking at the psbt input: the complete logic is
+            //   in `src/descriptor/mod.rs`, but it will basically look at `bip32_derivation`,
             //   `redeem_script` and `witness_script` to determine the right derivation
             // - If that also fails, it will try it on the internal descriptor, if present
             let desc = psbt
@@ -1917,12 +2037,13 @@ impl Wallet {
                         ),
                     ) {
                         Ok(_) => {
+                            let length = psbt.inputs.len();
                             // Set the UTXO fields, final script_sig and witness
                             // and clear everything else.
                             let psbt_input = psbt
                                 .inputs
                                 .get_mut(n)
-                                .ok_or(SignerError::InputIndexOutOfRange)?;
+                                .ok_or(IndexOutOfBoundsError::new(n, length))?;
                             let original = mem::take(psbt_input);
                             psbt_input.non_witness_utxo = original.non_witness_utxo;
                             psbt_input.witness_utxo = original.witness_utxo;
@@ -1956,13 +2077,14 @@ impl Wallet {
         &self.secp
     }
 
-    /// The derivation index of this wallet. It will return `None` if it has not derived any addresses.
-    /// Otherwise, it will return the index of the highest address it has derived.
+    /// The derivation index of this wallet. It will return `None` if it has not derived any
+    /// addresses. Otherwise, it will return the index of the highest address it has derived.
     pub fn derivation_index(&self, keychain: KeychainKind) -> Option<u32> {
         self.indexed_graph.index.last_revealed_index(keychain)
     }
 
-    /// The index of the next address that you would get if you were to ask the wallet for a new address
+    /// The index of the next address that you would get if you were to ask the wallet for a new
+    /// address
     pub fn next_derivation_index(&self, keychain: KeychainKind) -> u32 {
         self.indexed_graph
             .index
@@ -2002,6 +2124,11 @@ impl Wallet {
             vec![]
         // only process optional UTxOs if manually_selected_only is false
         } else {
+            let manually_selected_outpoints = params
+                .utxos
+                .iter()
+                .map(|wutxo| wutxo.utxo.outpoint())
+                .collect::<HashSet<OutPoint>>();
             self.indexed_graph
                 .graph()
                 // get all unspent UTxOs from wallet
@@ -2010,6 +2137,7 @@ impl Wallet {
                 .filter_chain_unspents(
                     &self.chain,
                     self.chain.tip().block_id(),
+                    CanonicalizationParams::default(),
                     self.indexed_graph.index.outpoints().iter().cloned(),
                 )
                 // only create LocalOutput if UTxO is mature
@@ -2018,10 +2146,12 @@ impl Wallet {
                         .is_mature(current_height)
                         .then(|| new_local_utxo(k, i, full_txo))
                 })
-                // only process UTxOs not selected manually, they will be considered later in the chain
-                // NOTE: this avoid UTxOs in both required and optional list
-                .filter(|may_spend| !params.utxos.contains_key(&may_spend.outpoint))
-                // only add to optional UTxOs those which satisfy the change policy if we reuse change
+                // only process UTXOs not selected manually, they will be considered later in the
+                // chain
+                // NOTE: this avoid UTXOs in both required and optional list
+                .filter(|may_spend| !manually_selected_outpoints.contains(&may_spend.outpoint))
+                // only add to optional UTxOs those which satisfy the change policy if we reuse
+                // change
                 .filter(|local_output| {
                     self.keychains().count() == 1
                         || params.change_policy.is_satisfied_by(local_output)
@@ -2153,8 +2283,12 @@ impl Wallet {
 
         let prev_output = utxo.outpoint;
         if let Some(prev_tx) = self.indexed_graph.graph().get_tx(prev_output.txid) {
+            // We want to check that the prevout actually exists in the tx before continuing.
+            let prevout = prev_tx.output.get(prev_output.vout as usize).ok_or(
+                MiniscriptPsbtError::UtxoUpdate(miniscript::psbt::UtxoUpdateError::UtxoCheck),
+            )?;
             if desc.is_witness() || desc.is_taproot() {
-                psbt_input.witness_utxo = Some(prev_tx.output[prev_output.vout as usize].clone());
+                psbt_input.witness_utxo = Some(prevout.clone());
             }
             if !desc.is_taproot() && (!desc.is_witness() || !only_witness_utxo) {
                 psbt_input.non_witness_utxo = Some(prev_tx.as_ref().clone());
@@ -2219,31 +2353,7 @@ impl Wallet {
     ///
     /// After applying updates you should persist the staged wallet changes. For an example of how
     /// to persist staged wallet changes see [`Wallet::reveal_next_address`].
-    #[cfg(feature = "std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     pub fn apply_update(&mut self, update: impl Into<Update>) -> Result<(), CannotConnectError> {
-        use std::time::*;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time now must surpass epoch anchor");
-        self.apply_update_at(update, now.as_secs())
-    }
-
-    /// Applies an `update` alongside a `seen_at` timestamp and stages the changes.
-    ///
-    /// `seen_at` represents when the update is seen (in unix seconds). It is used to determine the
-    /// `last_seen`s for all transactions in the update which have no corresponding anchor(s). The
-    /// `last_seen` value is used internally to determine precedence of conflicting unconfirmed
-    /// transactions (where the transaction with the lower `last_seen` value is omitted from the
-    /// canonical history).
-    ///
-    /// Use [`apply_update`](Wallet::apply_update) to have the `seen_at` value automatically set to
-    /// the current time.
-    pub fn apply_update_at(
-        &mut self,
-        update: impl Into<Update>,
-        seen_at: u64,
-    ) -> Result<(), CannotConnectError> {
         let update = update.into();
         let mut changeset = match update.chain {
             Some(chain_update) => ChangeSet::from(self.chain.apply_update(chain_update)?),
@@ -2255,11 +2365,7 @@ impl Wallet {
             .index
             .reveal_to_target_multi(&update.last_active_indices);
         changeset.merge(index_changeset.into());
-        changeset.merge(
-            self.indexed_graph
-                .apply_update_at(update.tx_update, Some(seen_at))
-                .into(),
-        );
+        changeset.merge(self.indexed_graph.apply_update(update.tx_update).into());
         self.stage.merge(changeset);
         Ok(())
     }
@@ -2382,6 +2488,66 @@ impl Wallet {
         self.stage.merge(indexed_graph_changeset.into());
     }
 
+    /// Apply evictions of the given transaction IDs with their associated timestamps.
+    ///
+    /// This function is used to mark specific unconfirmed transactions as evicted from the mempool.
+    /// Eviction means that these transactions are not considered canonical by default, and will
+    /// no longer be part of the wallet's [`transactions`] set. This can happen for example when
+    /// a transaction is dropped from the mempool due to low fees or conflicts with another
+    /// transaction.
+    ///
+    /// Only transactions that are currently unconfirmed and canonical are considered for eviction.
+    /// Transactions that are not relevant to the wallet are ignored. Note that an evicted
+    /// transaction can become canonical again if it is later observed on-chain or seen in the
+    /// mempool with a higher priority (e.g., due to a fee bump).
+    ///
+    /// ## Parameters
+    ///
+    /// `evicted_txs`: An iterator of `(Txid, u64)` tuples, where:
+    /// - `Txid`: The transaction ID of the transaction to be evicted.
+    /// - `u64`: The timestamp indicating when the transaction was evicted from the mempool. This
+    ///   will usually correspond to the time of the latest chain sync. See docs for
+    ///   [`start_sync_with_revealed_spks`].
+    ///
+    /// ## Notes
+    ///
+    /// - Not all blockchain backends support automatic mempool eviction handling - this method may
+    ///   be used in such cases. It can also be used to negate the effect of
+    ///   [`apply_unconfirmed_txs`] for a particular transaction without the need for an additional
+    ///   sync.
+    /// - The changes are staged in the wallet's internal state and must be persisted to ensure they
+    ///   are retained across wallet restarts. Use [`Wallet::take_staged`] to retrieve the staged
+    ///   changes and persist them to your database of choice.
+    /// - Evicted transactions are removed from the wallet's canonical transaction set, but the data
+    ///   remains in the wallet's internal transaction graph for historical purposes.
+    /// - Ensure that the timestamps provided are accurate and monotonically increasing, as they
+    ///   influence the wallet's canonicalization logic.
+    ///
+    /// [`transactions`]: Wallet::transactions
+    /// [`apply_unconfirmed_txs`]: Wallet::apply_unconfirmed_txs
+    /// [`start_sync_with_revealed_spks`]: Wallet::start_sync_with_revealed_spks
+    pub fn apply_evicted_txs(&mut self, evicted_txs: impl IntoIterator<Item = (Txid, u64)>) {
+        let chain = &self.chain;
+        let canon_txids: Vec<Txid> = self
+            .indexed_graph
+            .graph()
+            .list_canonical_txs(
+                chain,
+                chain.tip().block_id(),
+                CanonicalizationParams::default(),
+            )
+            .map(|c| c.tx_node.txid)
+            .collect();
+
+        let changeset = self.indexed_graph.batch_insert_relevant_evicted_at(
+            evicted_txs
+                .into_iter()
+                .filter(|(txid, _)| canon_txids.contains(txid)),
+        );
+
+        self.stage.merge(changeset.into());
+    }
+
     /// Used internally to ensure that all methods requiring a [`KeychainKind`] will use a
     /// keychain with an associated descriptor. For example in case the wallet was created
     /// with only one keychain, passing [`KeychainKind::Internal`] here will instead return
@@ -2397,16 +2563,48 @@ impl Wallet {
 
 /// Methods to construct sync/full-scan requests for spk-based chain sources.
 impl Wallet {
+    /// Create a partial [`SyncRequest`] for all revealed spks at `start_time`.
+    ///
+    /// The `start_time` is used to record the time that a mempool transaction was last seen
+    /// (or evicted). See [`Wallet::start_sync_with_revealed_spks`] for more.
+    pub fn start_sync_with_revealed_spks_at(
+        &self,
+        start_time: u64,
+    ) -> SyncRequestBuilder<(KeychainKind, u32)> {
+        use bdk_chain::keychain_txout::SyncRequestBuilderExt;
+        SyncRequest::builder_at(start_time)
+            .chain_tip(self.chain.tip())
+            .revealed_spks_from_indexer(&self.indexed_graph.index, ..)
+            .expected_spk_txids(self.indexed_graph.list_expected_spk_txids(
+                &self.chain,
+                self.chain.tip().block_id(),
+                ..,
+            ))
+    }
+
     /// Create a partial [`SyncRequest`] for this wallet for all revealed spks.
     ///
     /// This is the first step when performing a spk-based wallet partial sync, the returned
     /// [`SyncRequest`] collects all revealed script pubkeys from the wallet keychain needed to
     /// start a blockchain sync with a spk based blockchain client.
+    ///
+    /// The time of the sync is the current system time and is used to record the
+    /// tx last-seen for mempool transactions. Or if an expected transaction is missing
+    /// or evicted, it is the time of the eviction. Note that timestamps may only increase
+    /// to be counted by the tx graph. To supply your own start time see
+    /// [`Wallet::start_sync_with_revealed_spks_at`].
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+    #[cfg(feature = "std")]
     pub fn start_sync_with_revealed_spks(&self) -> SyncRequestBuilder<(KeychainKind, u32)> {
         use bdk_chain::keychain_txout::SyncRequestBuilderExt;
         SyncRequest::builder()
             .chain_tip(self.chain.tip())
             .revealed_spks_from_indexer(&self.indexed_graph.index, ..)
+            .expected_spk_txids(self.indexed_graph.list_expected_spk_txids(
+                &self.chain,
+                self.chain.tip().block_id(),
+                ..,
+            ))
     }
 
     /// Create a [`FullScanRequest] for this wallet.
@@ -2417,9 +2615,22 @@ impl Wallet {
     ///
     /// This operation is generally only used when importing or restoring a previously used wallet
     /// in which the list of used scripts is not known.
+    ///
+    /// The time of the scan is the current system time and is used to record the tx last-seen for
+    /// mempool transactions. To supply your own start time see [`Wallet::start_full_scan_at`].
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+    #[cfg(feature = "std")]
     pub fn start_full_scan(&self) -> FullScanRequestBuilder<KeychainKind> {
         use bdk_chain::keychain_txout::FullScanRequestBuilderExt;
         FullScanRequest::builder()
+            .chain_tip(self.chain.tip())
+            .spks_from_indexer(&self.indexed_graph.index)
+    }
+
+    /// Create a [`FullScanRequest`] builder at `start_time`.
+    pub fn start_full_scan_at(&self, start_time: u64) -> FullScanRequestBuilder<KeychainKind> {
+        use bdk_chain::keychain_txout::FullScanRequestBuilderExt;
+        FullScanRequest::builder_at(start_time)
             .chain_tip(self.chain.tip())
             .spks_from_indexer(&self.indexed_graph.index)
     }
@@ -2475,38 +2686,61 @@ fn new_local_utxo(
     }
 }
 
-fn create_indexer(
+fn make_indexed_graph(
+    stage: &mut ChangeSet,
+    tx_graph_changeset: chain::tx_graph::ChangeSet<ConfirmationBlockTime>,
+    indexer_changeset: chain::keychain_txout::ChangeSet,
     descriptor: ExtendedDescriptor,
     change_descriptor: Option<ExtendedDescriptor>,
     lookahead: u32,
-) -> Result<KeychainTxOutIndex<KeychainKind>, DescriptorError> {
-    let mut indexer = KeychainTxOutIndex::<KeychainKind>::new(lookahead);
+    use_spk_cache: bool,
+) -> Result<IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<KeychainKind>>, DescriptorError>
+{
+    let (indexed_graph, changeset) = IndexedTxGraph::from_changeset(
+        chain::indexed_tx_graph::ChangeSet {
+            tx_graph: tx_graph_changeset,
+            indexer: indexer_changeset,
+        },
+        |idx_cs| -> Result<KeychainTxOutIndex<KeychainKind>, DescriptorError> {
+            let mut idx = KeychainTxOutIndex::from_changeset(lookahead, use_spk_cache, idx_cs);
 
-    // let (descriptor, keymap) = descriptor;
-    // let signers = Arc::new(SignersContainer::build(keymap, &descriptor, secp));
-    assert!(indexer
-        .insert_descriptor(KeychainKind::External, descriptor)
-        .expect("first descriptor introduced must succeed"));
+            let descriptor_inserted = idx
+                .insert_descriptor(KeychainKind::External, descriptor)
+                .expect("already checked to be a unique, wildcard, non-multipath descriptor");
+            assert!(
+                descriptor_inserted,
+                "this must be the first time we are seeing this descriptor"
+            );
 
-    // let (descriptor, keymap) = change_descriptor;
-    // let change_signers = Arc::new(SignersContainer::build(keymap, &descriptor, secp));
-    if let Some(change_descriptor) = change_descriptor {
-        assert!(indexer
-            .insert_descriptor(KeychainKind::Internal, change_descriptor)
-            .map_err(|e| {
-                use bdk_chain::indexer::keychain_txout::InsertDescriptorError;
-                match e {
-                    InsertDescriptorError::DescriptorAlreadyAssigned { .. } => {
-                        crate::descriptor::error::Error::ExternalAndInternalAreTheSame
+            let change_descriptor = match change_descriptor {
+                Some(change_descriptor) => change_descriptor,
+                None => return Ok(idx),
+            };
+
+            let change_descriptor_inserted = idx
+                .insert_descriptor(KeychainKind::Internal, change_descriptor)
+                .map_err(|e| {
+                    use bdk_chain::indexer::keychain_txout::InsertDescriptorError;
+                    match e {
+                        InsertDescriptorError::DescriptorAlreadyAssigned { .. } => {
+                            crate::descriptor::error::Error::ExternalAndInternalAreTheSame
+                        }
+                        InsertDescriptorError::KeychainAlreadyAssigned { .. } => {
+                            unreachable!("this is the first time we're assigning internal")
+                        }
                     }
-                    InsertDescriptorError::KeychainAlreadyAssigned { .. } => {
-                        unreachable!("this is the first time we're assigning internal")
-                    }
-                }
-            })?);
-    }
+                })?;
+            assert!(
+                change_descriptor_inserted,
+                "this must be the first time we are seeing this descriptor"
+            );
 
-    Ok(indexer)
+            Ok(idx)
+        },
+    )?;
+    stage.tx_graph.merge(changeset.tx_graph);
+    stage.indexer.merge(changeset.indexer);
+    Ok(indexed_graph)
 }
 
 /// Transforms a [`FeeRate`] to `f64` with unit as sat/vb.
@@ -2563,6 +2797,7 @@ macro_rules! doctest_wallet {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::miniscript::Error::Unexpected;
     use crate::test_utils::get_test_tr_single_sig_xprv_and_change_desc;
     use crate::test_utils::insert_tx;
 
@@ -2599,18 +2834,10 @@ mod test {
         let txid = two_output_tx.compute_txid();
         insert_tx(&mut wallet, two_output_tx);
 
-        let mut params = TxParams::default();
-        let output = wallet.get_utxo(OutPoint { txid, vout: 0 }).unwrap();
-        params.utxos.insert(
-            output.outpoint,
-            WeightedUtxo {
-                satisfaction_weight: wallet
-                    .public_descriptor(output.keychain)
-                    .max_weight_to_satisfy()
-                    .unwrap(),
-                utxo: Utxo::Local(output),
-            },
-        );
+        let outpoint = OutPoint { txid, vout: 0 };
+        let mut builder = wallet.build_tx();
+        builder.add_utxo(outpoint).expect("should add local utxo");
+        let params = builder.params.clone();
         // enforce selection of first output in transaction
         let received = wallet.filter_utxos(&params, wallet.latest_checkpoint().block_id().height);
         // notice expected doesn't include the first output from two_output_tx as it should be
@@ -2627,5 +2854,71 @@ mod test {
             .unwrap()];
 
         assert_eq!(expected, received);
+    }
+
+    #[test]
+    fn test_create_two_path_wallet() {
+        let two_path_descriptor = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)";
+
+        // Test successful creation of a two-path wallet
+        let params = Wallet::create_from_two_path_descriptor(two_path_descriptor);
+        let wallet = params.network(Network::Testnet).create_wallet_no_persist();
+        assert!(wallet.is_ok());
+
+        let wallet = wallet.unwrap();
+
+        // Verify that the wallet has both external and internal keychains
+        let keychains: Vec<_> = wallet.keychains().collect();
+        assert_eq!(keychains.len(), 2);
+
+        // Verify that the descriptors are different (receive vs change)
+        let external_desc = keychains
+            .iter()
+            .find(|(k, _)| *k == KeychainKind::External)
+            .unwrap()
+            .1;
+        let internal_desc = keychains
+            .iter()
+            .find(|(k, _)| *k == KeychainKind::Internal)
+            .unwrap()
+            .1;
+        assert_ne!(external_desc.to_string(), internal_desc.to_string());
+
+        // Verify that addresses can be generated
+        let external_addr = wallet.peek_address(KeychainKind::External, 0);
+        let internal_addr = wallet.peek_address(KeychainKind::Internal, 0);
+        assert_ne!(external_addr.address, internal_addr.address);
+    }
+
+    #[test]
+    fn test_create_two_path_wallet_invalid_descriptor() {
+        // Test with invalid single-path descriptor
+        let single_path_descriptor = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)";
+        let params = Wallet::create_from_two_path_descriptor(single_path_descriptor);
+        let wallet = params.network(Network::Testnet).create_wallet_no_persist();
+        assert!(matches!(wallet, Err(DescriptorError::MultiPath)));
+
+        // Test with a private descriptor
+        // You get a Miniscript(Unexpected("Can't make an extended private key with multiple paths
+        // into a public key.")) error.
+        let private_multipath_descriptor = "wpkh(tprv8ZgxMBicQKsPdWAHbugK2tjtVtRjKGixYVZUdL7xLHMgXZS6BFbFi1UDb1CHT25Z5PU1F9j7wGxwUiRhqz9E3nZRztikGUV6HoRDYcqPhM4/84'/1'/0'/<0;1>/*)";
+        let params = Wallet::create_from_two_path_descriptor(private_multipath_descriptor);
+        let wallet = params.network(Network::Testnet).create_wallet_no_persist();
+        assert!(matches!(
+            wallet,
+            Err(DescriptorError::Miniscript(Unexpected(..)))
+        ));
+
+        // Test with invalid 3-path multipath descriptor
+        let three_path_descriptor = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1;2>/*)";
+        let params = Wallet::create_from_two_path_descriptor(three_path_descriptor);
+        let wallet = params.network(Network::Testnet).create_wallet_no_persist();
+        assert!(matches!(wallet, Err(DescriptorError::MultiPath)));
+
+        // Test with completely invalid descriptor
+        let invalid_descriptor = "invalid_descriptor";
+        let params = Wallet::create_from_two_path_descriptor(invalid_descriptor);
+        let wallet = params.network(Network::Testnet).create_wallet_no_persist();
+        assert!(wallet.is_err());
     }
 }

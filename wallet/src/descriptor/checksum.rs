@@ -19,7 +19,8 @@ use alloc::string::String;
 
 use miniscript::descriptor::checksum::desc_checksum;
 
-/// Compute the checksum of a descriptor, excludes any existing checksum in the descriptor string from the calculation
+/// Compute the checksum of a descriptor, excludes any existing checksum in the descriptor string
+/// from the calculation
 pub fn calc_checksum(desc: &str) -> Result<String, DescriptorError> {
     if let Some(split) = desc.split_once('#') {
         let og_checksum = split.1;
@@ -75,11 +76,11 @@ mod test {
     #[test]
     fn test_calc_checksum_invalid_character() {
         let sparkle_heart = unsafe { core::str::from_utf8_unchecked(&[240, 159, 146, 150]) };
-        let invalid_desc = format!("wpkh(tprv8ZgxMBicQKsPdpkqS7Eair4YxjcuuvDPNYmKX3sCniCf16tHEVrjjiSXEkFRnUH77yXc6ZcwHHcL{}fjdi5qUvw3VDfgYiH5mNsj5izuiu2N/1/2/*)", sparkle_heart);
+        let invalid_desc = format!("wpkh(tprv8ZgxMBicQKsPdpkqS7Eair4YxjcuuvDPNYmKX3sCniCf16tHEVrjjiSXEkFRnUH77yXc6ZcwHHcL{sparkle_heart}fjdi5qUvw3VDfgYiH5mNsj5izuiu2N/1/2/*)");
 
         assert_matches!(
             calc_checksum(&invalid_desc),
-            Err(DescriptorError::Miniscript(miniscript::Error::BadDescriptor(e))) if e == format!("Invalid character in checksum: '{}'", sparkle_heart)
+            Err(DescriptorError::Miniscript(miniscript::Error::BadDescriptor(e))) if e == format!("Invalid character in checksum: '{sparkle_heart}'")
         );
     }
 }

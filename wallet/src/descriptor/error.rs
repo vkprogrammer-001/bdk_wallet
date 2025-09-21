@@ -21,7 +21,8 @@ pub enum Error {
     InvalidDescriptorChecksum,
     /// The descriptor contains hardened derivation steps on public extended keys
     HardenedDerivationXpub,
-    /// The descriptor contains multipath keys
+    /// The descriptor contains multipath keys with an invalid number of paths (must have exactly 2
+    /// paths for receive and change)
     MultiPath,
     /// Error thrown while working with [`keys`](crate::keys)
     Key(crate::keys::KeyError),
@@ -68,18 +69,18 @@ impl fmt::Display for Error {
             ),
             Self::MultiPath => write!(
                 f,
-                "The descriptor contains multipath keys, which are not supported yet"
+                "The descriptor contains multipath keys with invalid number of paths (must have exactly 2 paths for receive and change)"
             ),
-            Self::Key(err) => write!(f, "Key error: {}", err),
-            Self::Policy(err) => write!(f, "Policy error: {}", err),
+            Self::Key(err) => write!(f, "Key error: {err}"),
+            Self::Policy(err) => write!(f, "Policy error: {err}"),
             Self::InvalidDescriptorCharacter(char) => {
-                write!(f, "Invalid descriptor character: {}", char)
+                write!(f, "Invalid descriptor character: {char}")
             }
-            Self::Bip32(err) => write!(f, "BIP32 error: {}", err),
-            Self::Base58(err) => write!(f, "Base58 error: {}", err),
-            Self::Pk(err) => write!(f, "Key-related error: {}", err),
-            Self::Miniscript(err) => write!(f, "Miniscript error: {}", err),
-            Self::Hex(err) => write!(f, "Hex decoding error: {}", err),
+            Self::Bip32(err) => write!(f, "BIP32 error: {err}"),
+            Self::Base58(err) => write!(f, "Base58 error: {err}"),
+            Self::Pk(err) => write!(f, "Key-related error: {err}"),
+            Self::Miniscript(err) => write!(f, "Miniscript error: {err}"),
+            Self::Hex(err) => write!(f, "Hex decoding error: {err}"),
             Self::ExternalAndInternalAreTheSame => {
                 write!(f, "External and internal descriptors are the same")
             }

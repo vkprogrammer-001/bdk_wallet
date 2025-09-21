@@ -61,6 +61,7 @@ use miniscript::{
 
 use crate::descriptor::ExtractPolicy;
 use crate::keys::ExtScriptContext;
+use crate::types::IndexOutOfBoundsError;
 use crate::wallet::signer::{SignerId, SignersContainer};
 use crate::wallet::utils::{After, Older, SecpCtx};
 
@@ -237,7 +238,8 @@ fn mix<T: Clone>(vec: Vec<Vec<T>>) -> Vec<Vec<T>> {
 
 /// Type for a map of sets of [`Condition`] items keyed by each set's index
 pub type ConditionMap = BTreeMap<usize, HashSet<Condition>>;
-/// Type for a map of folded sets of [`Condition`] items keyed by a vector of the combined set's indexes
+/// Type for a map of folded sets of [`Condition`] items keyed by a vector of the combined set's
+/// indexes
 pub type FoldedConditionMap = BTreeMap<Vec<usize>, HashSet<Condition>>;
 
 fn serialize_folded_cond_map<S>(
@@ -249,7 +251,7 @@ where
 {
     let mut map = serializer.serialize_map(Some(input_map.len()))?;
     for (k, v) in input_map {
-        let k_string = format!("{:?}", k);
+        let k_string = format!("{k:?}");
         map.serialize_entry(&k_string, v)?;
     }
     map.end()
@@ -323,7 +325,7 @@ impl Satisfaction {
                 ..
             } => {
                 if inner_index >= *n || items.contains(&inner_index) {
-                    return Err(PolicyError::IndexOutOfRange(inner_index));
+                    return Err(IndexOutOfBoundsError::new(inner_index, *n))?;
                 }
 
                 match inner {
@@ -363,14 +365,18 @@ impl Satisfaction {
             if items.len() >= *m {
                 let mut map = BTreeMap::new();
                 let indexes = combinations(items, *m);
-                // `indexes` at this point is a Vec<Vec<usize>>, with the "n choose k" of items (m of n)
+                // `indexes` at this point is a Vec<Vec<usize>>, with the "n choose k" of items (m
+                // of n)
                 indexes
                     .into_iter()
                     // .inspect(|x| println!("--- orig --- {:?}", x))
-                    // we map each of the combinations of elements into a tuple of ([chosen items], [conditions]). unfortunately, those items have potentially more than one
-                    // condition (think about ORs), so we also use `mix` to expand those, i.e. [[0], [1, 2]] becomes [[0, 1], [0, 2]]. This is necessary to make sure that we
+                    // we map each of the combinations of elements into a tuple of ([chosen items],
+                    // [conditions]). unfortunately, those items have potentially more than one
+                    // condition (think about ORs), so we also use `mix` to expand those, i.e. [[0],
+                    // [1, 2]] becomes [[0, 1], [0, 2]]. This is necessary to make sure that we
                     // consider every possible options and check whether or not they are compatible.
-                    // since this step can turn one item of the iterator into multiple ones, we use `flat_map()` to expand them out
+                    // since this step can turn one item of the iterator into multiple ones, we use
+                    // `flat_map()` to expand them out
                     .flat_map(|i_vec| {
                         mix(i_vec
                             .iter()
@@ -386,7 +392,8 @@ impl Satisfaction {
                         .collect::<Vec<(Vec<usize>, Vec<Condition>)>>()
                     })
                     // .inspect(|x| println!("flat {:?}", x))
-                    // try to fold all the conditions for this specific combination of indexes/options. if they are not compatible, try_fold will be Err
+                    // try to fold all the conditions for this specific combination of
+                    // indexes/options. if they are not compatible, try_fold will be Err
                     .map(|(key, val)| {
                         (
                             key,
@@ -503,15 +510,18 @@ impl Condition {
 /// Errors that can happen while extracting and manipulating policies
 #[derive(Debug, PartialEq, Eq)]
 pub enum PolicyError {
-    /// Not enough items are selected to satisfy a [`SatisfiableItem::Thresh`] or a [`SatisfiableItem::Multisig`]
+    /// Not enough items are selected to satisfy a [`SatisfiableItem::Thresh`] or a
+    /// [`SatisfiableItem::Multisig`]
     NotEnoughItemsSelected(String),
-    /// Index out of range for an item to satisfy a [`SatisfiableItem::Thresh`] or a [`SatisfiableItem::Multisig`]
-    IndexOutOfRange(usize),
+    /// Index out of range for an item to satisfy a [`SatisfiableItem::Thresh`] or a
+    /// [`SatisfiableItem::Multisig`]
+    IndexOutOfRange(IndexOutOfBoundsError),
     /// Can not add to an item that is [`Satisfaction::None`] or [`Satisfaction::Complete`]
     AddOnLeaf,
     /// Can not add to an item that is [`Satisfaction::PartialComplete`]
     AddOnPartialComplete,
-    /// Can not merge CSV or timelock values unless both are less than or both are equal or greater than 500_000_000
+    /// Can not merge CSV or timelock values unless both are less than or both are equal or greater
+    /// than 500_000_000
     MixedTimelockUnits,
     /// Incompatible conditions (not currently used)
     IncompatibleConditions,
@@ -520,13 +530,19 @@ pub enum PolicyError {
 impl fmt::Display for PolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotEnoughItemsSelected(err) => write!(f, "Not enough items selected: {}", err),
-            Self::IndexOutOfRange(index) => write!(f, "Index out of range: {}", index),
+            Self::NotEnoughItemsSelected(err) => write!(f, "Not enough items selected: {err}"),
+            Self::IndexOutOfRange(err) => write!(f, "{err}"),
             Self::AddOnLeaf => write!(f, "Add on leaf"),
             Self::AddOnPartialComplete => write!(f, "Add on partial complete"),
             Self::MixedTimelockUnits => write!(f, "Mixed timelock units"),
             Self::IncompatibleConditions => write!(f, "Incompatible conditions"),
         }
+    }
+}
+
+impl From<IndexOutOfBoundsError> for PolicyError {
+    fn from(err: IndexOutOfBoundsError) -> Self {
+        Self::IndexOutOfRange(err)
     }
 }
 
@@ -642,8 +658,8 @@ impl Policy {
     /// create a transaction
     ///
     /// What this means is that for some spending policies the user should select which paths in
-    /// the tree it intends to satisfy while signing, because the transaction must be created differently based
-    /// on that.
+    /// the tree it intends to satisfy while signing, because the transaction must be created
+    /// differently based on that.
     pub fn requires_path(&self) -> bool {
         self.get_condition(&BTreeMap::new()).is_err()
     }
@@ -686,7 +702,7 @@ impl Policy {
                 // make sure all the indexes in the `selected` list are within range
                 for index in &selected {
                     if *index >= items.len() {
-                        return Err(PolicyError::IndexOutOfRange(*index));
+                        return Err(IndexOutOfBoundsError::new(*index, items.len()))?;
                     }
                 }
 
@@ -709,7 +725,7 @@ impl Policy {
                     return Err(PolicyError::NotEnoughItemsSelected(self.id.clone()));
                 }
                 if let Some(item) = selected.into_iter().find(|&i| i >= keys.len()) {
-                    return Err(PolicyError::IndexOutOfRange(item));
+                    return Err(IndexOutOfBoundsError::new(item, keys.len()))?;
                 }
 
                 Ok(Condition::default())
@@ -1045,7 +1061,7 @@ impl<Ctx: ScriptContext + 'static> ExtractPolicy for Miniscript<DescriptorPublic
     }
 }
 
-fn psbt_inputs_sat(psbt: &Psbt) -> impl Iterator<Item = PsbtInputSatisfier> {
+fn psbt_inputs_sat(psbt: &Psbt) -> impl Iterator<Item = PsbtInputSatisfier<'_>> {
     (0..psbt.inputs.len()).map(move |i| PsbtInputSatisfier::new(psbt, i))
 }
 
@@ -1063,7 +1079,8 @@ pub enum BuildSatisfaction<'a> {
         /// Current blockchain height
         current_height: u32,
         /// The highest confirmation height between the inputs
-        /// CSV should consider different inputs, but we consider the worst condition for the tx as whole
+        /// CSV should consider different inputs, but we consider the worst condition for the tx as
+        /// whole
         input_max_height: u32,
     },
 }
@@ -1560,7 +1577,12 @@ mod test {
         // index out of range
         let out_of_range =
             policy.get_condition(&vec![(policy.id.clone(), vec![5])].into_iter().collect());
-        assert_eq!(out_of_range, Err(PolicyError::IndexOutOfRange(5)));
+        assert_eq!(
+            out_of_range,
+            Err(PolicyError::IndexOutOfRange(IndexOutOfBoundsError::new(
+                5, 2
+            )))
+        );
     }
 
     const ALICE_TPRV_STR:&str = "tprv8ZgxMBicQKsPf6T5X327efHnvJDr45Xnb8W4JifNWtEoqXu9MRYS4v1oYe6DFcMVETxy5w3bqpubYRqvcVTqovG1LifFcVUuJcbwJwrhYzP";
@@ -1633,6 +1655,7 @@ mod test {
         );
     }
 
+    #[rustfmt::skip]
     #[test]
     fn test_extract_satisfaction_timelock() {
         //const PSBT_POLICY_CONSIDER_TIMELOCK_NOT_EXPIRED: &str = "cHNidP8BAFMBAAAAAdld52uJFGT7Yde0YZdSVh2vL020Zm2exadH5R4GSNScAAAAAAD/////ATrcAAAAAAAAF6kUXv2Fn+YemPP4PUpNR1ZbU16/eRCHAAAAAAABASvI3AAAAAAAACIAILhzvvcBzw/Zfnc9ispRK0PCahxn1F6RHXTZAmw5tqNPAQVSdmNSsmlofCEDeAtjYQk/Vfu4db2+68hyMKjc38+kWl5sP5QH8L42Zsusk3whAvhhP8vi6bSPMZokerDnvffCBs8m6MdEH8+PgUJdZ5mIrJNShyIGAvhhP8vi6bSPMZokerDnvffCBs8m6MdEH8+PgUJdZ5mIDBwu7j4AAACAAAAAACIGA3gLY2EJP1X7uHW9vuvIcjCo3N/PpFpebD+UB/C+NmbLDMkRfC4AAACAAAAAAAAA";

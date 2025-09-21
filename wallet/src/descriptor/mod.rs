@@ -14,6 +14,7 @@
 //! This module contains generic utilities to work with descriptors, plus some re-exported types
 //! from [`miniscript`].
 
+use crate::alloc::string::ToString;
 use crate::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -69,7 +70,8 @@ pub type HdKeyPaths = BTreeMap<secp256k1::PublicKey, KeySource>;
 /// [`psbt::Output`]: bitcoin::psbt::Output
 pub type TapKeyOrigins = BTreeMap<XOnlyPublicKey, (Vec<taproot::TapLeafHash>, KeySource)>;
 
-/// Trait for types which can be converted into an [`ExtendedDescriptor`] and a [`KeyMap`] usable by a wallet in a specific [`Network`]
+/// Trait for types which can be converted into an [`ExtendedDescriptor`] and a [`KeyMap`] usable by
+/// a wallet in a specific [`Network`]
 pub trait IntoWalletDescriptor {
     /// Convert to wallet descriptor
     fn into_wallet_descriptor(
@@ -311,7 +313,11 @@ pub(crate) fn check_wallet_descriptor(
     }
 
     if descriptor.is_multipath() {
-        return Err(DescriptorError::MultiPath);
+        return Err(DescriptorError::Miniscript(
+            miniscript::Error::BadDescriptor(
+                "`check_wallet_descriptor` must not contain multipath keys".to_string(),
+            ),
+        ));
     }
 
     // Run miniscript's sanity check, which will look for duplicated keys and other potential
@@ -460,10 +466,11 @@ impl DescriptorMeta for ExtendedDescriptor {
         // using `for_any_key` should make this stop as soon as we return `true`
         self.for_any_key(|key| {
             if let DescriptorPublicKey::XPub(xpub) = key {
-                // Check if the key matches one entry in our `key_origins`. If it does, `matches()` will
-                // return the "prefix" that matched, so we remove that prefix from the full path
-                // found in `key_origins` and save it in `derive_path`. We expect this to be a derivation
-                // path of length 1 if the key is `wildcard` and an empty path otherwise.
+                // Check if the key matches one entry in our `key_origins`. If it does, `matches()`
+                // will return the "prefix" that matched, so we remove that prefix
+                // from the full path found in `key_origins` and save it in
+                // `derive_path`. We expect this to be a derivation path of length 1
+                // if the key is `wildcard` and an empty path otherwise.
                 let root_fingerprint = xpub.root_fingerprint(secp);
                 let derive_path = key_origins
                     .get_key_value(&root_fingerprint)
@@ -478,10 +485,11 @@ impl DescriptorMeta for ExtendedDescriptor {
                             .cloned()
                             .collect::<DerivationPath>();
 
-                        // `derive_path` only contains the replacement index for the wildcard, if present, or
-                        // an empty path for fixed descriptors. To verify the key we also need the normal steps
-                        // that come before the wildcard, so we take them directly from `xpub` and then append
-                        // the final index
+                        // `derive_path` only contains the replacement index for the wildcard, if
+                        // present, or an empty path for fixed descriptors.
+                        // To verify the key we also need the normal steps
+                        // that come before the wildcard, so we take them directly from `xpub` and
+                        // then append the final index
                         if verify_key(
                             xpub,
                             &xpub.derivation_path.extend(derive_path.clone()),
@@ -872,13 +880,19 @@ mod test {
 
         assert_matches!(result, Err(DescriptorError::HardenedDerivationXpub));
 
+        // Any multipath descriptor should fail
         let descriptor = "wpkh(tpubD6NzVbkrYhZ4XHndKkuB8FifXm8r5FQHwrN6oZuWCz13qb93rtgKvD4PQsqC4HP4yhV3tA2fqr2RbY5mNXfM7RxXUoeABoDtsFUq2zJq6YK/<0;1>/*)";
         let (descriptor, _) = descriptor
             .into_wallet_descriptor(&secp, Network::Testnet)
             .expect("must parse");
         let result = check_wallet_descriptor(&descriptor);
 
-        assert_matches!(result, Err(DescriptorError::MultiPath));
+        assert_matches!(
+            result,
+            Err(DescriptorError::Miniscript(
+                miniscript::Error::BadDescriptor(_)
+            ))
+        );
 
         // repeated pubkeys
         let descriptor = "wsh(multi(2,tpubD6NzVbkrYhZ4XHndKkuB8FifXm8r5FQHwrN6oZuWCz13qb93rtgKvD4PQsqC4HP4yhV3tA2fqr2RbY5mNXfM7RxXUoeABoDtsFUq2zJq6YK/0/*,tpubD6NzVbkrYhZ4XHndKkuB8FifXm8r5FQHwrN6oZuWCz13qb93rtgKvD4PQsqC4HP4yhV3tA2fqr2RbY5mNXfM7RxXUoeABoDtsFUq2zJq6YK/0/*))";
@@ -913,5 +927,49 @@ mod test {
 
         assert_eq!(psbt_input.redeem_script, Some(script.to_p2wsh()));
         assert_eq!(psbt_input.witness_script, Some(script));
+    }
+
+    #[test]
+    fn test_into_wallet_descriptor_multi() -> anyhow::Result<()> {
+        // See <https://github.com/bitcoindevkit/bdk_wallet/issues/10>
+        let secp = Secp256k1::new();
+
+        // multipath tpub
+        let descriptor_str = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)";
+        let (descriptor, _key_map) = descriptor_str
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .expect("should parse multipath tpub");
+
+        assert!(descriptor.is_multipath());
+
+        // invalid network for descriptor
+        let descriptor_str = "wpkh([9a6a2580/84'/0'/0']xpub6DEzNop46vmxR49zYWFnMwmEfawSNmAMf6dLH5YKDY463twtvw1XD7ihwJRLPRGZJz799VPFzXHpZu6WdhT29WnaeuChS6aZHZPFmqczR5K/<0;1>/*)";
+        let res = descriptor_str.into_wallet_descriptor(&secp, Network::Testnet);
+
+        assert!(matches!(
+            res,
+            Err(DescriptorError::Key(KeyError::InvalidNetwork))
+        ));
+
+        // multipath xpub
+        let descriptor_str = "wpkh([9a6a2580/84'/0'/0']xpub6DEzNop46vmxR49zYWFnMwmEfawSNmAMf6dLH5YKDY463twtvw1XD7ihwJRLPRGZJz799VPFzXHpZu6WdhT29WnaeuChS6aZHZPFmqczR5K/<0;1>/*)";
+        let (descriptor, _key_map) = descriptor_str
+            .into_wallet_descriptor(&secp, Network::Bitcoin)
+            .expect("should parse multipath xpub");
+
+        assert!(descriptor.is_multipath());
+
+        // Miniscript can't make an extended private key with multiple paths into a public key.
+        // ref: <https://docs.rs/miniscript/12.3.2/miniscript/descriptor/enum.DescriptorSecretKey.html#method.to_public>
+        let descriptor_str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/<0;1>/*)";
+        assert!(matches!(
+            Descriptor::parse_descriptor(&secp, descriptor_str),
+            Err(miniscript::Error::Unexpected(..)),
+        ));
+        let _ = descriptor_str
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .unwrap_err();
+
+        Ok(())
     }
 }

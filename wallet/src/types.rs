@@ -12,6 +12,7 @@
 use alloc::boxed::Box;
 use chain::{ChainPosition, ConfirmationBlockTime};
 use core::convert::AsRef;
+use core::fmt;
 
 use bitcoin::transaction::{OutPoint, Sequence, TxOut};
 use bitcoin::{psbt, Weight};
@@ -33,6 +34,15 @@ impl KeychainKind {
         match self {
             KeychainKind::External => b'e',
             KeychainKind::Internal => b'i',
+        }
+    }
+}
+
+impl fmt::Display for KeychainKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KeychainKind::External => write!(f, "External"),
+            KeychainKind::Internal => write!(f, "Internal"),
         }
     }
 }
@@ -69,7 +79,8 @@ pub struct LocalOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightedUtxo {
     /// The weight of the witness data and `scriptSig` expressed in [weight units]. This is used to
-    /// properly maintain the feerate when adding this input to a transaction during coin selection.
+    /// properly maintain the feerate when adding this input to a transaction during coin
+    /// selection.
     ///
     /// [weight units]: https://en.bitcoin.it/wiki/Weight_units
     pub satisfaction_weight: Weight,
@@ -133,3 +144,32 @@ impl Utxo {
         }
     }
 }
+
+/// Index out of bounds error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexOutOfBoundsError {
+    /// The index that is out of range.
+    pub index: usize,
+    /// The length of the container.
+    pub len: usize,
+}
+
+impl IndexOutOfBoundsError {
+    /// Create a new `IndexOutOfBoundsError`.
+    pub fn new(index: usize, len: usize) -> Self {
+        Self { index, len }
+    }
+}
+
+impl fmt::Display for IndexOutOfBoundsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Index out of bounds: index {} is greater than or equal to length {}",
+            self.index, self.len
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for IndexOutOfBoundsError {}

@@ -106,6 +106,7 @@ use miniscript::{SigType, ToPublicKey};
 use super::utils::SecpCtx;
 use crate::descriptor::{DescriptorMeta, XKeyUtils};
 use crate::psbt::PsbtUtils;
+use crate::types::IndexOutOfBoundsError;
 use crate::wallet::error::MiniscriptPsbtError;
 
 /// Identifier of a signer in the `SignersContainers`. Used as a key to find the right signer among
@@ -142,7 +143,7 @@ pub enum SignerError {
     /// The user canceled the operation
     UserCanceled,
     /// Input index is out of range
-    InputIndexOutOfRange,
+    InputIndexOutOfRange(IndexOutOfBoundsError),
     /// The `non_witness_utxo` field of the transaction is required to sign this input
     MissingNonWitnessUtxo,
     /// The `non_witness_utxo` specified is invalid
@@ -179,7 +180,7 @@ impl fmt::Display for SignerError {
             Self::MissingKey => write!(f, "Missing private key"),
             Self::InvalidKey => write!(f, "The private key in use has the right fingerprint but derives differently than expected"),
             Self::UserCanceled => write!(f, "The user canceled the operation"),
-            Self::InputIndexOutOfRange => write!(f, "Input index out of range"),
+            Self::InputIndexOutOfRange(err) => write!(f, "{err}"),
             Self::MissingNonWitnessUtxo => write!(f, "Missing non-witness UTXO"),
             Self::InvalidNonWitnessUtxo => write!(f, "Invalid non-witness UTXO"),
             Self::MissingWitnessUtxo => write!(f, "Missing witness UTXO"),
@@ -187,11 +188,17 @@ impl fmt::Display for SignerError {
             Self::MissingHdKeypath => write!(f, "Missing fingerprint and derivation path"),
             Self::NonStandardSighash => write!(f, "The psbt contains a non standard sighash"),
             Self::InvalidSighash => write!(f, "Invalid SIGHASH for the signing context in use"),
-            Self::SighashTaproot(err) => write!(f, "Error while computing the hash to sign a Taproot input: {}", err),
-            Self::Psbt(err) => write!(f, "Error computing the sighash: {}", err),
-            Self::MiniscriptPsbt(err) => write!(f, "Miniscript PSBT error: {}", err),
-            Self::External(err) => write!(f, "{}", err),
+            Self::SighashTaproot(err) => write!(f, "Error while computing the hash to sign a Taproot input: {err}"),
+            Self::Psbt(err) => write!(f, "Error computing the sighash: {err}"),
+            Self::MiniscriptPsbt(err) => write!(f, "Miniscript PSBT error: {err}"),
+            Self::External(err) => write!(f, "{err}"),
         }
+    }
+}
+
+impl From<IndexOutOfBoundsError> for SignerError {
+    fn from(err: IndexOutOfBoundsError) -> Self {
+        Self::InputIndexOutOfRange(err)
     }
 }
 
@@ -240,8 +247,8 @@ impl<S: Sized + fmt::Debug + Clone> Deref for SignerWrapper<S> {
 pub trait SignerCommon: fmt::Debug + Send + Sync {
     /// Return the [`SignerId`] for this signer
     ///
-    /// The [`SignerId`] can be used to lookup a signer in the [`Wallet`](crate::Wallet)'s signers map or to
-    /// compare two signers.
+    /// The [`SignerId`] can be used to lookup a signer in the [`Wallet`](crate::Wallet)'s signers
+    /// map or to compare two signers.
     fn id(&self, secp: &SecpCtx) -> SignerId;
 
     /// Return the secret key for the signer
@@ -256,9 +263,9 @@ pub trait SignerCommon: fmt::Debug + Send + Sync {
 
 /// PSBT Input signer
 ///
-/// This trait can be implemented to provide custom signers to the wallet. If the signer supports signing
-/// individual inputs, this trait should be implemented and BDK will provide automatically an implementation
-/// for [`TransactionSigner`].
+/// This trait can be implemented to provide custom signers to the wallet. If the signer supports
+/// signing individual inputs, this trait should be implemented and BDK will provide automatically
+/// an implementation for [`TransactionSigner`].
 pub trait InputSigner: SignerCommon {
     /// Sign a single psbt input
     fn sign_input(
@@ -272,8 +279,8 @@ pub trait InputSigner: SignerCommon {
 
 /// PSBT signer
 ///
-/// This trait can be implemented when the signer can't sign inputs individually, but signs the whole transaction
-/// at once.
+/// This trait can be implemented when the signer can't sign inputs individually, but signs the
+/// whole transaction at once.
 pub trait TransactionSigner: SignerCommon {
     /// Sign all the inputs of the psbt
     fn sign_transaction(
@@ -318,7 +325,7 @@ impl InputSigner for SignerWrapper<DescriptorXKey<Xpriv>> {
         secp: &SecpCtx,
     ) -> Result<(), SignerError> {
         if input_index >= psbt.inputs.len() {
-            return Err(SignerError::InputIndexOutOfRange);
+            return Err(IndexOutOfBoundsError::new(input_index, psbt.inputs.len()))?;
         }
 
         if psbt.inputs[input_index].final_script_sig.is_some()
@@ -442,8 +449,14 @@ impl InputSigner for SignerWrapper<PrivateKey> {
         sign_options: &SignOptions,
         secp: &SecpCtx,
     ) -> Result<(), SignerError> {
-        if input_index >= psbt.inputs.len() || input_index >= psbt.unsigned_tx.input.len() {
-            return Err(SignerError::InputIndexOutOfRange);
+        if input_index >= psbt.inputs.len() {
+            return Err(IndexOutOfBoundsError::new(input_index, psbt.inputs.len()))?;
+        }
+        if input_index >= psbt.unsigned_tx.input.len() {
+            return Err(IndexOutOfBoundsError::new(
+                input_index,
+                psbt.unsigned_tx.input.len(),
+            ))?;
         }
 
         if psbt.inputs[input_index].final_script_sig.is_some()
@@ -577,7 +590,7 @@ fn sign_psbt_schnorr(
     let keypair = match leaf_hash {
         None => keypair
             .tap_tweak(secp, psbt_input.tap_merkle_root)
-            .to_inner(),
+            .to_keypair(),
         Some(_) => keypair, // no tweak for script spend
     };
 
@@ -766,8 +779,8 @@ pub struct SignOptions {
     /// a transaction
     ///
     /// The wallet will only "use" a timelock to satisfy the spending policy of an input if the
-    /// timelock height has already been reached. This option allows overriding the "current height" to let the
-    /// wallet use timelocks in the future to spend a coin.
+    /// timelock height has already been reached. This option allows overriding the "current
+    /// height" to let the wallet use timelocks in the future to spend a coin.
     pub assume_height: Option<u32>,
 
     /// Whether the signer should use the `sighash_type` set in the PSBT when signing, no matter
@@ -834,8 +847,14 @@ fn compute_tap_sighash(
     input_index: usize,
     extra: Option<taproot::TapLeafHash>,
 ) -> Result<(sighash::TapSighash, TapSighashType), SignerError> {
-    if input_index >= psbt.inputs.len() || input_index >= psbt.unsigned_tx.input.len() {
-        return Err(SignerError::InputIndexOutOfRange);
+    if input_index >= psbt.inputs.len() {
+        Err(IndexOutOfBoundsError::new(input_index, psbt.inputs.len()))?;
+    }
+    if input_index >= psbt.unsigned_tx.input.len() {
+        Err(IndexOutOfBoundsError::new(
+            input_index,
+            psbt.unsigned_tx.input.len(),
+        ))?;
     }
 
     let psbt_input = &psbt.inputs[input_index];

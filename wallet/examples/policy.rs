@@ -20,11 +20,11 @@ use bdk_wallet::signer::SignersContainer;
 ///
 /// Policy is higher abstraction representation of the wallet descriptor spending condition.
 /// This is useful to express complex miniscript spending conditions into more human readable form.
-/// The resulting `Policy` structure  can be used to derive spending conditions the wallet is capable
-/// to spend from.
+/// The resulting `Policy` structure  can be used to derive spending conditions the wallet is
+/// capable to spend from.
 ///
-/// This example demos a Policy output for a 2of2 multisig between between 2 parties, where the wallet holds
-/// one of the Extend Private key.
+/// This example demos a Policy output for a 2of2 multisig between between 2 parties, where the
+/// wallet holds one of the Extend Private key.
 #[allow(clippy::print_stdout)]
 fn main() -> Result<(), Box<dyn Error>> {
     let secp = bitcoin::secp256k1::Secp256k1::new();
@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // But they can be used as independent tools also.
     let (wallet_desc, keymap) = desc.into_wallet_descriptor(&secp, Network::Testnet)?;
 
-    println!("Example Descriptor for policy analysis : {}", wallet_desc);
+    println!("Example Descriptor for policy analysis : {wallet_desc}");
 
     // Create the signer with the keymap and descriptor.
     let signers_container = SignersContainer::build(keymap, &wallet_desc, &secp);
@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .extract_policy(&signers_container, BuildSatisfaction::None, &secp)?
         .expect("We expect a policy");
 
-    println!("Derived Policy for the descriptor {:#?}", policy);
+    println!("Derived Policy for the descriptor {policy:#?}");
 
     Ok(())
 }

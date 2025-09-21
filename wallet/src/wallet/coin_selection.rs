@@ -204,14 +204,15 @@ pub trait CoinSelectionAlgorithm: core::fmt::Debug {
     /// Perform the coin selection
     ///
     /// - `required_utxos`: the utxos that must be spent regardless of `target_amount` with their
-    ///                     weight cost
+    ///   weight cost
     /// - `optional_utxos`: the remaining available utxos to satisfy `target_amount` with their
-    ///                     weight cost
+    ///   weight cost
     /// - `fee_rate`: fee rate to use
-    /// - `target_amount`: the outgoing amount and the fees already accumulated from adding
-    ///                    outputs and transaction’s header.
+    /// - `target_amount`: the outgoing amount and the fees already accumulated from adding outputs
+    ///   and transaction’s header.
     /// - `drain_script`: the script to use in case of change
-    /// - `rand`: random number generated used by some coin selection algorithms such as [`SingleRandomDraw`]
+    /// - `rand`: random number generated used by some coin selection algorithms such as
+    ///   [`SingleRandomDraw`]
     fn coin_select<R: RngCore>(
         &self,
         required_utxos: Vec<WeightedUtxo>,
@@ -254,10 +255,11 @@ impl CoinSelectionAlgorithm for LargestFirstCoinSelection {
     }
 }
 
-/// OldestFirstCoinSelection always picks the utxo with the smallest blockheight to add to the selected coins next
+/// OldestFirstCoinSelection always picks the utxo with the smallest blockheight to add to the
+/// selected coins next
 ///
-/// This coin selection algorithm sorts the available UTXOs by blockheight and then picks them starting
-/// from the oldest ones until the required amount is reached.
+/// This coin selection algorithm sorts the available UTXOs by blockheight and then picks them
+/// starting from the oldest ones until the required amount is reached.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OldestFirstCoinSelection;
 
@@ -273,11 +275,12 @@ impl CoinSelectionAlgorithm for OldestFirstCoinSelection {
     ) -> Result<CoinSelectionResult, InsufficientFunds> {
         // We put the "required UTXOs" first and make sure the optional UTXOs are sorted from
         // oldest to newest according to blocktime
-        // For utxo that doesn't exist in DB, they will have lowest priority to be selected
+        // For UTXOs that doesn't exist in DB (Utxo::Foreign), they will have lowest priority to be
+        // selected
         let utxos = {
             optional_utxos.sort_unstable_by_key(|wu| match &wu.utxo {
-                Utxo::Local(local) => Some(local.chain_position),
-                Utxo::Foreign { .. } => None,
+                Utxo::Local(local) => (false, Some(local.chain_position)),
+                Utxo::Foreign { .. } => (true, None),
             });
 
             required_utxos
@@ -407,8 +410,8 @@ pub struct BranchAndBoundCoinSelection<Cs = SingleRandomDraw> {
 /// Error returned by branch and bound coin selection.
 #[derive(Debug)]
 enum BnbError {
-    /// Branch and bound coin selection tries to avoid needing a change by finding the right inputs for
-    /// the desired outputs plus fee, if there is not such combination this error is thrown
+    /// Branch and bound coin selection tries to avoid needing a change by finding the right inputs
+    /// for the desired outputs plus fee, if there is not such combination this error is thrown
     NoExactMatch,
     /// Branch and bound coin selection possible attempts with sufficiently big UTXO set could grow
     /// exponentially, thus a limit is set, and when hit, this error is thrown
@@ -608,15 +611,17 @@ impl<Cs> BranchAndBoundCoinSelection<Cs> {
 
             // Backtracking, moving backwards
             if backtrack {
-                // Walk backwards to find the last included UTXO that still needs to have its omission branch traversed.
+                // Walk backwards to find the last included UTXO that still needs to have its
+                // omission branch traversed.
                 while let Some(false) = current_selection.last() {
                     current_selection.pop();
                     curr_available_value += optional_utxos[current_selection.len()].effective_value;
                 }
 
                 if current_selection.last_mut().is_none() {
-                    // We have walked back to the first utxo and no branch is untraversed. All solutions searched
-                    // If best selection is empty, then there's no exact match
+                    // We have walked back to the first utxo and no branch is untraversed. All
+                    // solutions searched If best selection is empty, then
+                    // there's no exact match
                     if best_selection.is_empty() {
                         return Err(BnbError::NoExactMatch);
                     }
@@ -722,10 +727,11 @@ fn calculate_cs_result(
 mod test {
     use assert_matches::assert_matches;
     use bitcoin::hashes::Hash;
-    use bitcoin::OutPoint;
+    use bitcoin::{psbt, OutPoint, Sequence};
     use chain::{ChainPosition, ConfirmationBlockTime};
     use core::str::FromStr;
     use rand::rngs::StdRng;
+    use std::boxed::Box;
 
     use bitcoin::{Amount, BlockHash, ScriptBuf, TxIn, TxOut};
 
@@ -746,6 +752,7 @@ mod test {
             value,
             index,
             ChainPosition::Unconfirmed {
+                first_seen: Some(last_seen),
                 last_seen: Some(last_seen),
             },
         )
@@ -773,6 +780,29 @@ mod test {
         )
     }
 
+    fn foreign_utxo(value: Amount, index: u32) -> WeightedUtxo {
+        assert!(index < 10);
+        let outpoint = OutPoint::from_str(&format!(
+            "000000000000000000000000000000000000000000000000000000000000000{index}:0"
+        ))
+        .unwrap();
+        WeightedUtxo {
+            utxo: Utxo::Foreign {
+                outpoint,
+                sequence: Sequence(0xFFFFFFFD),
+                psbt_input: Box::new(psbt::Input {
+                    witness_utxo: Some(TxOut {
+                        value,
+                        script_pubkey: ScriptBuf::new(),
+                    }),
+                    non_witness_utxo: None,
+                    ..Default::default()
+                }),
+            },
+            satisfaction_weight: Weight::from_wu_usize(P2WPKH_SATISFACTION_SIZE),
+        }
+    }
+
     fn utxo(
         value: Amount,
         index: u32,
@@ -780,8 +810,7 @@ mod test {
     ) -> WeightedUtxo {
         assert!(index < 10);
         let outpoint = OutPoint::from_str(&format!(
-            "000000000000000000000000000000000000000000000000000000000000000{}:0",
-            index
+            "000000000000000000000000000000000000000000000000000000000000000{index}:0"
         ))
         .unwrap();
         WeightedUtxo {
@@ -823,8 +852,7 @@ mod test {
                 satisfaction_weight: Weight::from_wu_usize(P2WPKH_SATISFACTION_SIZE),
                 utxo: Utxo::Local(LocalOutput {
                     outpoint: OutPoint::from_str(&format!(
-                        "ebd9813ecebc57ff8f30797de7c205e3c7498ca950ea4341ee51a685ff2fa30a:{}",
-                        i
+                        "ebd9813ecebc57ff8f30797de7c205e3c7498ca950ea4341ee51a685ff2fa30a:{i}"
                     ))
                     .unwrap(),
                     txout: TxOut {
@@ -846,7 +874,10 @@ mod test {
                             transitively: None,
                         }
                     } else {
-                        ChainPosition::Unconfirmed { last_seen: Some(0) }
+                        ChainPosition::Unconfirmed {
+                            first_seen: Some(1),
+                            last_seen: Some(1),
+                        }
                     },
                 }),
             });
@@ -860,8 +891,7 @@ mod test {
                 satisfaction_weight: Weight::from_wu_usize(P2WPKH_SATISFACTION_SIZE),
                 utxo: Utxo::Local(LocalOutput {
                     outpoint: OutPoint::from_str(&format!(
-                        "ebd9813ecebc57ff8f30797de7c205e3c7498ca950ea4341ee51a685ff2fa30a:{}",
-                        i
+                        "ebd9813ecebc57ff8f30797de7c205e3c7498ca950ea4341ee51a685ff2fa30a:{i}"
                     ))
                     .unwrap(),
                     txout: TxOut {
@@ -871,7 +901,10 @@ mod test {
                     keychain: KeychainKind::External,
                     is_spent: false,
                     derivation_index: 42,
-                    chain_position: ChainPosition::Unconfirmed { last_seen: Some(0) },
+                    chain_position: ChainPosition::Unconfirmed {
+                        first_seen: Some(1),
+                        last_seen: Some(1),
+                    },
                 }),
             })
             .collect()
@@ -1038,6 +1071,59 @@ mod test {
         assert_eq!(result.selected.len(), 3);
         assert_eq!(result.selected_amount(), Amount::from_sat(500_000));
         assert_eq!(result.fee_amount, Amount::from_sat(204));
+    }
+
+    #[test]
+    fn test_oldest_first_coin_selection_uses_all_optional_with_foreign_utxo_locals_sorted_first() {
+        let utxos = get_oldest_first_test_utxos();
+        let mut all_utxos = vec![foreign_utxo(Amount::from_sat(120_000), 1)];
+        all_utxos.extend_from_slice(&utxos);
+        let drain_script = ScriptBuf::default();
+        let target_amount = Amount::from_sat(619_000) + FEE_AMOUNT;
+
+        let result = OldestFirstCoinSelection
+            .coin_select(
+                vec![],
+                all_utxos,
+                FeeRate::from_sat_per_vb_unchecked(1),
+                target_amount,
+                &drain_script,
+                &mut thread_rng(),
+            )
+            .unwrap();
+
+        assert_eq!(result.selected.len(), 4);
+        assert_eq!(result.selected_amount(), Amount::from_sat(620_000));
+        assert_eq!(result.fee_amount, Amount::from_sat(272));
+        assert!(matches!(result.selected[3], Utxo::Foreign { .. }));
+    }
+
+    #[test]
+    fn test_oldest_first_coin_selection_uses_only_all_optional_local_utxos_not_a_single_foreign() {
+        let utxos = get_oldest_first_test_utxos();
+        let mut all_utxos = vec![foreign_utxo(Amount::from_sat(120_000), 1)];
+        all_utxos.extend_from_slice(&utxos);
+        let drain_script = ScriptBuf::default();
+        let target_amount = Amount::from_sat(499_000) + FEE_AMOUNT;
+
+        let result = OldestFirstCoinSelection
+            .coin_select(
+                vec![],
+                all_utxos,
+                FeeRate::from_sat_per_vb_unchecked(1),
+                target_amount,
+                &drain_script,
+                &mut thread_rng(),
+            )
+            .unwrap();
+
+        assert_eq!(result.selected.len(), 3);
+        assert_eq!(result.selected_amount(), Amount::from_sat(500_000));
+        assert_eq!(result.fee_amount, Amount::from_sat(204));
+        assert!(result
+            .selected
+            .iter()
+            .all(|utxo| matches!(utxo, Utxo::Local(..))));
     }
 
     #[test]
@@ -1227,7 +1313,10 @@ mod test {
         optional.push(utxo(
             Amount::from_sat(500_000),
             3,
-            ChainPosition::<ConfirmationBlockTime>::Unconfirmed { last_seen: Some(0) },
+            ChainPosition::<ConfirmationBlockTime>::Unconfirmed {
+                first_seen: Some(1),
+                last_seen: Some(1),
+            },
         ));
 
         // Defensive assertions, for sanity and in case someone changes the test utxos vector.

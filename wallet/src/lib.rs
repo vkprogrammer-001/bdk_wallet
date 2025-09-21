@@ -7,6 +7,7 @@
 )]
 #![no_std]
 #![warn(missing_docs)]
+#![allow(clippy::uninlined_format_args)]
 
 #[cfg(feature = "std")]
 #[macro_use]
@@ -30,6 +31,10 @@ pub mod keys;
 pub mod psbt;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
+
+#[cfg(feature = "test-utils")]
+pub mod persist_test_utils;
+
 mod types;
 mod wallet;
 

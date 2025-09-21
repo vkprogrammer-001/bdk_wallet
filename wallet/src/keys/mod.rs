@@ -27,7 +27,7 @@ use bitcoin::secp256k1::{self, Secp256k1, Signing};
 use bitcoin::bip32;
 use bitcoin::{key::XOnlyPublicKey, Network, PrivateKey, PublicKey};
 
-use miniscript::descriptor::{Descriptor, DescriptorXKey, Wildcard};
+use miniscript::descriptor::{Descriptor, DescriptorMultiXKey, DescriptorXKey, Wildcard};
 pub use miniscript::descriptor::{
     DescriptorPublicKey, DescriptorSecretKey, KeyMap, SinglePriv, SinglePub, SinglePubKey,
     SortedMultiVec,
@@ -105,9 +105,10 @@ impl<Ctx: ScriptContext> DescriptorKey<Ctx> {
         }
     }
 
-    // This method is used internally by `bdk_wallet::fragment!` and `bdk_wallet::descriptor!`. It has to be
-    // public because it is effectively called by external crates once the macros are expanded,
-    // but since it is not meant to be part of the public api we hide it from the docs.
+    // This method is used internally by `bdk_wallet::fragment!` and `bdk_wallet::descriptor!`. It
+    // has to be public because it is effectively called by external crates once the macros are
+    // expanded, but since it is not meant to be part of the public api we hide it from the
+    // docs.
     #[doc(hidden)]
     pub fn extract(
         self,
@@ -281,8 +282,8 @@ impl<Ctx: ScriptContext + 'static> ExtScriptContext for Ctx {
 /// }
 /// ```
 ///
-/// Key type that can only work within [`miniscript::Segwitv0`] context. Only the specialized version
-/// of the trait is implemented.
+/// Key type that can only work within [`miniscript::Segwitv0`] context. Only the specialized
+/// version of the trait is implemented.
 ///
 /// This example deliberately fails to compile, to demonstrate how the compiler can catch when keys
 /// are misused. In this case, the "segwit-only" key is used to build a `pkh()` descriptor, which
@@ -662,7 +663,8 @@ pub trait GeneratableKey<Ctx: ScriptContext>: Sized {
 
 /// Trait that allows generating a key with the default options
 ///
-/// This trait is automatically implemented if the [`GeneratableKey::Options`] implements [`Default`].
+/// This trait is automatically implemented if the [`GeneratableKey::Options`] implements
+/// [`Default`].
 pub trait GeneratableDefaultOptions<Ctx>: GeneratableKey<Ctx>
 where
     Ctx: ScriptContext,
@@ -878,10 +880,20 @@ impl<Ctx: ScriptContext> IntoDescriptorKey<Ctx> for DescriptorPublicKey {
     fn into_descriptor_key(self) -> Result<DescriptorKey<Ctx>, KeyError> {
         let networks = match self {
             DescriptorPublicKey::Single(_) => any_network(),
-            DescriptorPublicKey::XPub(DescriptorXKey { xkey, .. }) if xkey.network.is_mainnet() => {
-                mainnet_network()
+            DescriptorPublicKey::XPub(DescriptorXKey { xkey, .. }) => {
+                if xkey.network.is_mainnet() {
+                    mainnet_network()
+                } else {
+                    test_networks()
+                }
             }
-            _ => test_networks(),
+            DescriptorPublicKey::MultiXPub(DescriptorMultiXKey { xkey, .. }) => {
+                if xkey.network.is_mainnet() {
+                    mainnet_network()
+                } else {
+                    test_networks()
+                }
+            }
         };
 
         Ok(DescriptorKey::from_public(self, networks))
@@ -977,9 +989,9 @@ impl fmt::Display for KeyError {
             Self::InvalidScriptContext => write!(f, "Invalid script context"),
             Self::InvalidNetwork => write!(f, "Invalid network"),
             Self::InvalidChecksum => write!(f, "Invalid checksum"),
-            Self::Message(err) => write!(f, "{}", err),
-            Self::Bip32(err) => write!(f, "BIP32 error: {}", err),
-            Self::Miniscript(err) => write!(f, "Miniscript error: {}", err),
+            Self::Message(err) => write!(f, "{err}"),
+            Self::Bip32(err) => write!(f, "BIP32 error: {err}"),
+            Self::Miniscript(err) => write!(f, "Miniscript error: {err}"),
         }
     }
 }

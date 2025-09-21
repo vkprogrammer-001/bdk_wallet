@@ -1,16 +1,19 @@
 use bdk_bitcoind_rpc::{
     bitcoincore_rpc::{Auth, Client, RpcApi},
-    Emitter,
+    Emitter, MempoolEvent,
 };
+use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::{
-    bitcoin::{Block, Network, Transaction},
-    file_store::Store,
+    bitcoin::{Block, Network},
     KeychainKind, Wallet,
 };
 use clap::{self, Parser};
-use std::{path::PathBuf, sync::mpsc::sync_channel, thread::spawn, time::Instant};
-
-const DB_MAGIC: &str = "bdk-rpc-wallet-example";
+use std::{
+    path::PathBuf,
+    sync::{mpsc::sync_channel, Arc},
+    thread::spawn,
+    time::Instant,
+};
 
 /// Bitcoind RPC example using `bdk_wallet::Wallet`.
 ///
@@ -36,7 +39,7 @@ pub struct Args {
     #[clap(
         env = "BDK_DB_PATH",
         long,
-        default_value = ".bdk_wallet_rpc_example.db"
+        default_value = "test_data/bdk-example-rpc.sqlite"
     )]
     pub db_path: PathBuf,
 
@@ -44,7 +47,11 @@ pub struct Args {
     #[clap(env = "RPC_URL", long, default_value = "127.0.0.1:18443")]
     pub url: String,
     /// RPC auth cookie file
-    #[clap(env = "RPC_COOKIE", long)]
+    #[clap(
+        env = "RPC_COOKIE",
+        long,
+        default_value = "test_data/bitcoind/regtest/.cookie"
+    )]
     pub rpc_cookie: Option<PathBuf>,
     /// RPC auth username
     #[clap(env = "RPC_USER", long)]
@@ -73,21 +80,20 @@ impl Args {
 enum Emission {
     SigTerm,
     Block(bdk_bitcoind_rpc::BlockEvent<Block>),
-    Mempool(Vec<(Transaction, u64)>),
+    Mempool(MempoolEvent),
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let rpc_client = args.client()?;
+    let rpc_client = Arc::new(args.client()?);
     println!(
         "Connected to Bitcoin Core RPC at {:?}",
         rpc_client.get_blockchain_info().unwrap()
     );
 
     let start_load_wallet = Instant::now();
-    let mut db =
-        Store::<bdk_wallet::ChangeSet>::open_or_create_new(DB_MAGIC.as_bytes(), args.db_path)?;
+    let mut db = Connection::open(args.db_path)?;
     let wallet_opt = Wallet::load()
         .descriptor(KeychainKind::External, Some(args.descriptor.clone()))
         .descriptor(KeychainKind::Internal, args.change_descriptor.clone())
@@ -110,6 +116,9 @@ fn main() -> anyhow::Result<()> {
         start_load_wallet.elapsed().as_secs_f32()
     );
 
+    let address = wallet.reveal_next_address(KeychainKind::External).address;
+    println!("Wallet address: {address}");
+
     let balance = wallet.balance();
     println!("Wallet balance before syncing: {}", balance.total());
 
@@ -123,15 +132,21 @@ fn main() -> anyhow::Result<()> {
     let (sender, receiver) = sync_channel::<Emission>(21);
 
     let signal_sender = sender.clone();
-    ctrlc::set_handler(move || {
+    let _ = ctrlc::set_handler(move || {
         signal_sender
             .send(Emission::SigTerm)
             .expect("failed to send sigterm")
     });
 
-    let emitter_tip = wallet_tip.clone();
+    let mut emitter = Emitter::new(
+        rpc_client,
+        wallet_tip,
+        args.start_height,
+        wallet
+            .transactions()
+            .filter(|tx| tx.chain_position.is_unconfirmed()),
+    );
     spawn(move || -> Result<(), anyhow::Error> {
-        let mut emitter = Emitter::new(&rpc_client, emitter_tip, args.start_height);
         while let Some(emission) = emitter.next_block()? {
             sender.send(Emission::Block(emission))?;
         }
@@ -155,14 +170,12 @@ fn main() -> anyhow::Result<()> {
                 wallet.apply_block_connected_to(&block_emission.block, height, connected_to)?;
                 wallet.persist(&mut db)?;
                 let elapsed = start_apply_block.elapsed().as_secs_f32();
-                println!(
-                    "Applied block {} at height {} in {}s",
-                    hash, height, elapsed
-                );
+                println!("Applied block {hash} at height {height} in {elapsed}s");
             }
-            Emission::Mempool(mempool_emission) => {
+            Emission::Mempool(event) => {
                 let start_apply_mempool = Instant::now();
-                wallet.apply_unconfirmed_txs(mempool_emission);
+                wallet.apply_evicted_txs(event.evicted);
+                wallet.apply_unconfirmed_txs(event.update);
                 wallet.persist(&mut db)?;
                 println!(
                     "Applied unconfirmed transactions in {}s",
